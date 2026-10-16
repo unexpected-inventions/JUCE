@@ -188,6 +188,7 @@ bool X11Symbols::loadAllSymbols()
                        makeSymbolBinding (xSetIOErrorHandler,          "XSetIOErrorHandler"),
                        makeSymbolBinding (xSetInputFocus,              "XSetInputFocus"),
                        makeSymbolBinding (xSetSelectionOwner,          "XSetSelectionOwner"),
+                       makeSymbolBinding (xSetTransientForHint,        "XSetTransientForHint"),
                        makeSymbolBinding (xSetWMHints,                 "XSetWMHints"),
                        makeSymbolBinding (xSetWMIconName,              "XSetWMIconName"),
                        makeSymbolBinding (xSetWMName,                  "XSetWMName"),
@@ -247,7 +248,10 @@ bool X11Symbols::loadAllSymbols()
                  makeSymbolBinding (xiQueryVersion,              "XIQueryVersion"),
                  makeSymbolBinding (xiQueryDevice,               "XIQueryDevice"),
                  makeSymbolBinding (xiFreeDeviceInfo,            "XIFreeDeviceInfo"),
-                 makeSymbolBinding (xiSelectEvents,              "XISelectEvents"));
+                 makeSymbolBinding (xiSelectEvents,              "XISelectEvents"),
+                 makeSymbolBinding (xiGetClientPointer,          "XIGetClientPointer"),
+                 makeSymbolBinding (xiGrabDevice,                "XIGrabDevice"),
+                 makeSymbolBinding (xiUngrabDevice,              "XIUngrabDevice"));
    #endif
 
     return true;

@@ -339,6 +339,19 @@ public:
     JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XISelectEvents, xiSelectEvents,
                                          (::Display*, ::Window, XIEventMask*, int),
                                          Status)
+
+    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XIGetClientPointer, xiGetClientPointer,
+                                         (::Display*, ::Window, int*),
+                                         Bool)
+
+    JUCE_GENERATE_FUNCTION_WITH_DEFAULT_RESULT (XIGrabDevice, xiGrabDevice,
+                                                (::Display*, int, ::Window, ::Time, Cursor, int, int, Bool, XIEventMask*),
+                                                Status,
+                                                BadRequest)
+
+    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XIUngrabDevice, xiUngrabDevice,
+                                         (::Display*, int, ::Time),
+                                         Status)
    #endif
 
     JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XkbKeycodeToKeysym, xkbKeycodeToKeysym,
@@ -476,6 +489,10 @@ public:
     JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XSetSelectionOwner, xSetSelectionOwner,
                                          (::Display*, Atom, ::Window, ::Time),
                                          void)
+
+    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XSetTransientForHint, xSetTransientForHint,
+                                         (::Display*, ::Window, ::Window),
+                                         int)
 
     JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XSetWMHints, xSetWMHints,
                                          (::Display*, ::Window, XWMHints*),
