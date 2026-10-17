@@ -131,6 +131,7 @@ public:
         warningAlertWindow,
         infoAlertWindow,
         questionAlertWindow,
+        yesCancelAlertWindow,
         yesNoCancelAlertWindow,
         extraComponentsAlertWindow,
         calloutBoxWindow,
@@ -157,6 +158,7 @@ public:
                                   "Alert Window With Warning Icon",
                                   "Alert Window With Info Icon",
                                   "Alert Window With Question Icon",
+                                  "Yes Cancel Alert Window",
                                   "Yes No Cancel Alert Window",
                                   "Alert Window With Extra Components",
                                   "CalloutBox",
@@ -293,6 +295,16 @@ private:
                                                              "And this is the AlertWindow's message. "
                                                              "Blah blah blah blah blah blah blah blah blah blah blah blah blah.");
             messageBox = AlertWindow::showScopedAsync (options, nullptr);
+        }
+        else if (type == yesCancelAlertWindow)
+        {
+            auto options = MessageBoxOptions{}.withIconType (MessageBoxIconType::QuestionIcon)
+                                              .withTitle ("This is a yes/cancel AlertWindow")
+                                              .withMessage ("And this is the AlertWindow's message. "
+                                                            "Blah blah blah blah blah blah blah blah blah blah blah blah blah.")
+                                              .withButton (TRANS ("Yes"), 1)
+                                              .withButton (TRANS ("Cancel"), 2);
+            messageBox = AlertWindow::showScopedAsync (options, getAlertBoxResultChosen());
         }
         else if (type == yesNoCancelAlertWindow)
         {
