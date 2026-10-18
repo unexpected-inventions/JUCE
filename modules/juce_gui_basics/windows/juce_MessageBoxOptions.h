@@ -48,6 +48,15 @@ enum class MessageBoxIconType
                          a response from them. */
 };
 
+/** Sets the button type. When using native dialogues use unique button types (i.e. don't use a button type twice).*/
+enum class MessageBoxButtonType
+{
+    Default,         /**< Default button, may be selected by pressing [ENTER].  */
+    Cancel,          /**< Cancel button, may be selected by pressing [CANCEL] or clicking elsewhere on the screen on Android.  */
+    Neutral,         /**< Neutral button.  */
+    Destructive      /**< A button which will be marked red on iOS to indicate a destructive action. Other plattforms will treat it as neutral. */
+};
+
 //==============================================================================
 /** Class used to create a set of options to pass to the AlertWindow and NativeMessageBox
     methods for showing dialog boxes.
@@ -60,8 +69,8 @@ enum class MessageBoxIconType
                               .withIconType (MessageBoxIconType::InfoIcon)
                               .withTitle ("A Title")
                               .withMessage ("A message.")
-                              .withButton ("OK", 1)
-                              .withButton ("Cancel", 0)
+                              .withButton ("OK", 1, MessageBoxButtonType::Default)
+                              .withButton ("Cancel", 0, MessageBoxButtonType::Cancel)
                               .withAssociatedComponent (myComp),
                             myCallback);
     @endcode
@@ -91,13 +100,12 @@ public:
         than this may have no effect.
 
         On Android, native message boxes may be dismissed by tapping outside the box. In this case,
-        the result code will match that of the final button in the MessageBoxOptions. If there are
-        no buttons, the result code will be 0.
+        the result code will be 0.
     */
-    [[nodiscard]] MessageBoxOptions withButton (const String& text, int resultCode) const
+    [[nodiscard]] MessageBoxOptions withButton (const String& text, int resultCode, MessageBoxButtonType buttonType = MessageBoxButtonType::Neutral) const
     {
         auto copy = *this;
-        copy.buttons.push_back ({ text, resultCode });
+        copy.buttons.push_back ({ text, resultCode, buttonType });
         return copy;
     }
 
@@ -166,6 +174,16 @@ public:
         // Button index does not refer to a known button!
         jassertfalse;
         return {};
+    }
+    
+    MessageBoxButtonType getButtonType (int buttonIndex) const
+    {
+        if (isPositiveAndBelow (buttonIndex, buttons.size()))
+            return buttons[(size_t) buttonIndex].buttonType;
+
+        // Button index does not refer to a known button!
+        jassertfalse;
+        return {};    
     }
 
     /** Returns true if all buttons have a unique result code, or false otherwise. */
@@ -244,6 +262,7 @@ private:
     {
         String text;
         int code{};
+        MessageBoxButtonType buttonType;
     };
 
     MessageBoxIconType iconType = MessageBoxIconType::InfoIcon;

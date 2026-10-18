@@ -63,29 +63,29 @@ std::unique_ptr<ScopedMessageBoxInterface> ScopedMessageBoxInterface::create (co
 
             setText (AndroidAlertDialogBuilder.setTitle,   opts.getTitle());
             setText (AndroidAlertDialogBuilder.setMessage, opts.getMessage());
-            builder = LocalRef<jobject> (env->CallObjectMethod (builder, AndroidAlertDialogBuilder.setCancelable, false));
+            builder = LocalRef<jobject> (env->CallObjectMethod (builder, AndroidAlertDialogBuilder.setCancelable, true));
 
             builder = LocalRef<jobject> (env->CallObjectMethod (builder,
                                                                 AndroidAlertDialogBuilder.setOnCancelListener,
                                                                 CreateJavaInterface (makeDialogListener (std::nullopt),
                                                                                      "android/content/DialogInterface$OnCancelListener").get()));
 
-            const jmethodID buttonTextSetters[] { AndroidAlertDialogBuilder.setPositiveButton,
-                                                  AndroidAlertDialogBuilder.setNegativeButton,
-                                                  AndroidAlertDialogBuilder.setNeutralButton };
-
-            for (const auto [index, method] : enumerate (buttonTextSetters, int{}))
+            for (auto i = 0; i < opts.getNumButtons(); ++i)
             {
-                if (opts.getNumButtons() <= index)
-                    break;
+                const auto text = opts.getButtonText (i);
 
-                if (opts.getButtonText (index).isEmpty())
+                if (text.isEmpty())
                     continue;
-
+                    
+                auto buttonType = opts.getButtonType (i);
+                const jmethodID buttonTextSetter = buttonType == MessageBoxButtonType::Cancel  ? AndroidAlertDialogBuilder.setNegativeButton
+                                                 : buttonType == MessageBoxButtonType::Default ? AndroidAlertDialogBuilder.setPositiveButton
+                                                                                               : AndroidAlertDialogBuilder.setNeutralButton;
+                
                 builder = LocalRef<jobject> (env->CallObjectMethod (builder,
-                                                                    method,
-                                                                    javaString (opts.getButtonText (index)).get(),
-                                                                    CreateJavaInterface (makeDialogListener (opts.getButtonResultCode (index)),
+                                                                    buttonTextSetter,
+                                                                    javaString (text).get(),
+                                                                    CreateJavaInterface (makeDialogListener (opts.getButtonResultCode (i)),
                                                                                          "android/content/DialogInterface$OnClickListener").get()));
             }
 

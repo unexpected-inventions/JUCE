@@ -71,9 +71,14 @@ std::unique_ptr<ScopedMessageBoxInterface> ScopedMessageBoxInterface::create (co
 
                 if (text.isEmpty())
                     continue;
+                    
+                auto buttonType = options.getButtonType (i);
+                UIAlertActionStyle actionStyle = buttonType == MessageBoxButtonType::Cancel      ? UIAlertActionStyleCancel
+                                               : buttonType == MessageBoxButtonType::Destructive ? UIAlertActionStyleDestructive
+                                                                                                 : UIAlertActionStyleDefault;
 
                 auto* action = [UIAlertAction actionWithTitle: juceStringToNS (text)
-                                                        style: UIAlertActionStyleDefault
+                                                        style: actionStyle
                                                       handler: ^(UIAlertAction*)
                 {
                     MessageManager::callAsync ([recipient, i, opt = options]
@@ -85,9 +90,8 @@ std::unique_ptr<ScopedMessageBoxInterface> ScopedMessageBoxInterface::create (co
 
                 [alert.get() addAction: action];
 
-//                This makes the first button bold, which it is not the usual iOS behaviour:
-//                if (i == 0)
-//                    [alert.get() setPreferredAction: action];
+                if (buttonType == MessageBoxButtonType::Default)
+                    [alert.get() setPreferredAction: action];
             }
 
             [peerToUse->controller presentViewController: alert.get()
