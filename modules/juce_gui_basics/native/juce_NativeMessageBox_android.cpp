@@ -63,18 +63,39 @@ std::unique_ptr<ScopedMessageBoxInterface> ScopedMessageBoxInterface::create (co
 
             setText (AndroidAlertDialogBuilder.setTitle,   opts.getTitle());
             setText (AndroidAlertDialogBuilder.setMessage, opts.getMessage());
-            builder = LocalRef<jobject> (env->CallObjectMethod (builder, AndroidAlertDialogBuilder.setCancelable, true));
+
+            const auto& buttons = opts.getButtons();
+            const auto cancelIter = buttons.size() == 1
+                                  ? buttons.begin()
+                                  : std::find_if (buttons.begin(),
+                                                  buttons.end(),
+                                                  [] (const auto& b) { return b.getRole() == MessageBoxButtonRole::cancel; });
+
+            jboolean cancelable = cancelIter != buttons.end() || buttons.empty();
+            builder = LocalRef<jobject> (env->CallObjectMethod (builder,
+                                                                AndroidAlertDialogBuilder.setCancelable,
+                                                                cancelable));
 
             builder = LocalRef<jobject> (env->CallObjectMethod (builder,
                                                                 AndroidAlertDialogBuilder.setOnCancelListener,
-                                                                CreateJavaInterface (makeDialogListener (std::nullopt),
+                                                                CreateJavaInterface (makeDialogListener (cancelIter != buttons.end() ? std::make_optional (cancelIter->getCode()) : std::nullopt),
                                                                                      "android/content/DialogInterface$OnCancelListener").get()));
 
-            for (auto i = 0; i < opts.getNumButtons(); ++i)
-            {
-                const auto text = opts.getButtonText (i);
+            const jmethodID buttonTextSetters[] { AndroidAlertDialogBuilder.setPositiveButton,
+                                                  AndroidAlertDialogBuilder.setNegativeButton,
+                                                  AndroidAlertDialogBuilder.setNeutralButton };
 
-                if (text.isEmpty())
+            const auto buttonOrder = AlertWindowHelpers::getSuggestedButtonOrder (opts);
+
+            for (const auto [index, method] : enumerate (buttonTextSetters, size_t{}))
+            {
+                if (buttonOrder.size() <= index)
+                    break;
+
+                const auto buttonIndex = buttonOrder[index];
+                const auto& button = buttons[(size_t) buttonIndex];
+
+                if (button.getText().isEmpty())
                     continue;
                     
                 auto buttonType = opts.getButtonType (i);
@@ -83,9 +104,9 @@ std::unique_ptr<ScopedMessageBoxInterface> ScopedMessageBoxInterface::create (co
                                                                                                : AndroidAlertDialogBuilder.setPositiveButton;
                 
                 builder = LocalRef<jobject> (env->CallObjectMethod (builder,
-                                                                    buttonTextSetter,
-                                                                    javaString (text).get(),
-                                                                    CreateJavaInterface (makeDialogListener (opts.getButtonResultCode (i)),
+                                                                    method,
+                                                                    javaString (button.getText()).get(),
+                                                                    CreateJavaInterface (makeDialogListener (button.getCode()),
                                                                                          "android/content/DialogInterface$OnClickListener").get()));
             }
 
