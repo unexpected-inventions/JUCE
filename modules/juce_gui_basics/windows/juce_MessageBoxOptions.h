@@ -174,8 +174,8 @@ private:
                               .withIconType (MessageBoxIconType::InfoIcon)
                               .withTitle ("A Title")
                               .withMessage ("A message.")
-                              .withButton ("OK", 1, MessageBoxButtonType::Default)
-                              .withButton ("Cancel", 0, MessageBoxButtonType::Cancel)
+                              .withButton ("OK", 1)
+                              .withButton ("Cancel", 0)
                               .withAssociatedComponent (myComp),
                             myCallback);
     @endcode
@@ -218,10 +218,10 @@ public:
         Cancelling a message box with a different number of buttons will return the code of
         whichever button has the 'cancel' role.
     */
-    [[nodiscard]] MessageBoxOptions withButton (const String& text, int resultCode, MessageBoxButtonType buttonType = MessageBoxButtonType::Neutral) const
+    [[nodiscard]] MessageBoxOptions withButton (const String& text, int resultCode) const
     {
         auto copy = *this;
-        copy.buttons.push_back ({ text, resultCode, buttonType });
+        copy.buttons.push_back ({ text, resultCode });
         return copy;
     }
 
@@ -313,16 +313,6 @@ public:
         // Button index does not refer to a known button!
         jassertfalse;
         return {};
-    }
-    
-    MessageBoxButtonType getButtonType (int buttonIndex) const
-    {
-        if (isPositiveAndBelow (buttonIndex, buttons.size()))
-            return buttons[(size_t) buttonIndex].buttonType;
-
-        // Button index does not refer to a known button!
-        jassertfalse;
-        return {};    
     }
 
     /** Returns the properties of all buttons in the message box. */

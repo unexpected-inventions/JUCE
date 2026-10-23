@@ -98,11 +98,6 @@ std::unique_ptr<ScopedMessageBoxInterface> ScopedMessageBoxInterface::create (co
                 if (button.getText().isEmpty())
                     continue;
                     
-                auto buttonType = opts.getButtonType (i);
-                const jmethodID buttonTextSetter = buttonType == MessageBoxButtonType::Cancel  ? AndroidAlertDialogBuilder.setNegativeButton
-                                                 : buttonType == MessageBoxButtonType::Neutral ? AndroidAlertDialogBuilder.setNeutralButton
-                                                                                               : AndroidAlertDialogBuilder.setPositiveButton;
-                
                 builder = LocalRef<jobject> (env->CallObjectMethod (builder,
                                                                     method,
                                                                     javaString (button.getText()).get(),

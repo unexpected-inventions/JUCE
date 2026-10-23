@@ -91,11 +91,6 @@ std::unique_ptr<ScopedMessageBoxInterface> ScopedMessageBoxInterface::create (co
 
                 if (text.isEmpty())
                     continue;
-                    
-                auto buttonType = options.getButtonType (i);
-                UIAlertActionStyle actionStyle = buttonType == MessageBoxButtonType::Cancel      ? UIAlertActionStyleCancel
-                                               : buttonType == MessageBoxButtonType::Destructive ? UIAlertActionStyleDestructive
-                                                                                                 : UIAlertActionStyleDefault;
 
                 const auto style = std::invoke ([&]
                 {
