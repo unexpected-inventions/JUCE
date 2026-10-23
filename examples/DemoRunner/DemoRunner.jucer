@@ -113,7 +113,10 @@
                    cameraPermissionNeeded="1" androidReadMediaAudioPermission="1"
                    androidReadMediaImagesPermission="1" androidReadMediaVideoPermission="1"
                    androidBluetoothScanNeeded="1" androidBluetoothAdvertiseNeeded="1"
-                   androidBluetoothConnectNeeded="1" androidEnableVirtualMidi="1">
+                   androidBluetoothConnectNeeded="1" androidEnableVirtualMidi="1"
+                   userNotes="@android:style/Theme.NoTitleBar&#10;@android:style/Theme.Material.Light.NoActionBar&#10;@android:style/Theme.DeviceDefault&#10;@android:style/Theme.Holo.Light&#10;&#10;&#10;@style/Theme.MaterialComponents.DayNight.NoActionBar&#10;implementation ('com.google.android.material:material:1.11.0')&#10;&#10;"
+                   androidDependencies="implementation('com.google.android.play:review:2.0.2') {&#10;    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'&#10;    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8'&#10;}&#10;implementation ('com.google.android.material:material:1.11.0')"
+                   androidTheme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
       <CONFIGURATIONS>
         <CONFIGURATION isDebug="1" name="Debug" recommendedWarnings="LLVM" androidAdditionalRawValueResources="Source/accessibilitynotificationicon.png"/>
         <CONFIGURATION isDebug="0" name="Release" recommendedWarnings="LLVM" androidAdditionalRawValueResources="Source/accessibilitynotificationicon.png"/>
