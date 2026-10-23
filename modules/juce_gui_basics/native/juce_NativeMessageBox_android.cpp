@@ -97,7 +97,7 @@ std::unique_ptr<ScopedMessageBoxInterface> ScopedMessageBoxInterface::create (co
 
                 if (button.getText().isEmpty())
                     continue;
-                    
+
                 builder = LocalRef<jobject> (env->CallObjectMethod (builder,
                                                                     method,
                                                                     javaString (button.getText()).get(),
