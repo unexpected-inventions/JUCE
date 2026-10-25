@@ -2029,7 +2029,8 @@ void UIViewComponentPeer::updateScreenBounds()
     {
         auto newDesktop = desktop.getDisplays().getPrimaryDisplay()->userBounds.getSmallestIntegerContainer();
 
-        if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion: (NSOperatingSystemVersion){16, 0, 0}])
+        NSOperatingSystemVersion ver = { 16, 0, 0 };
+        if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion: ver])
         {
             if (newDesktop != oldDesktop)
             {
