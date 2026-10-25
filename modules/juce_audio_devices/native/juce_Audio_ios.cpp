@@ -371,13 +371,13 @@ struct iOSAudioIODevice::Pimpl final : public AsyncUpdater
 
     static void setAudioSessionCategory (NSString* category)
     {
+//        bool bluetooth = false;
+//        
+//        for (AVAudioSessionPortDescription* port in [AVAudioSession sharedInstance].currentRoute.outputs)
+//            if ([port.portType containsString: @"Bluetooth"])
+//                bluetooth = true;
+        
         NSUInteger options = 0;
-        
-        bool bluetooth = false;
-        
-        for (AVAudioSessionPortDescription* port in [AVAudioSession sharedInstance].currentRoute.outputs)
-            if ([port.portType containsString: @"Bluetooth"])
-                bluetooth = true;
 
        #if ! JUCE_DISABLE_AUDIO_MIXING_WITH_OTHER_APPS
         options |= AVAudioSessionCategoryOptionMixWithOthers;
