@@ -89,11 +89,11 @@ public:
             [centralController release];
     }
 
-    void paint (Graphics& g) override
-    {
+//    void paint (Graphics& g) override
+//    {
 //        g.fillAll (getLookAndFeel().findColour (juce::ResizableWindow::backgroundColourId).withAlpha (0.7f));
 //        g.fillAll (Colours::black.withAlpha (0.25f));
-    }
+//    }
 
     void inputAttemptWhenModal() override           { close(); }
     void mouseDrag (const MouseEvent&) override     {}
