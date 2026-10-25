@@ -246,7 +246,7 @@ private:
                                                                     .withIconType (MessageBoxIconType::InfoIcon)
                                                                     .withTitle ("Alert Box")
                                                                     .withMessage ("Result code: " + String (result))
-                                                                    .withButton ("OK", 0),
+                                                                    .withButton (MessageBoxButtonOptions { "OK", 0 }.setRole (MessageBoxButtonRole::cancel)),
                                                                 nullptr);
         };
     }
@@ -278,7 +278,7 @@ private:
                                                                 .withMessage ("Result code: " + String (result) + newLine
                                                                               + "Option index chosen: " + String (optionIndexChosen) + newLine
                                                                               + "Text: " + text)
-                                                                .withButton ("OK", 0),
+                                                                .withButton (MessageBoxButtonOptions { "OK", 0 }.setRole (MessageBoxButtonRole::cancel)),
                                                             nullptr);
         };
     }
@@ -304,7 +304,7 @@ private:
             auto options = MessageBoxOptions{}.withIconType (MessageBoxIconType::InfoIcon)
                                               .withTitle ("This is an AlertWindow with a single button")
                                               .withMessage ("Confirmation and cancellation will return the same value.")
-                                              .withButton (MessageBoxButtonOptions { TRANS ("OK"), 100 });
+                                              .withButton (MessageBoxButtonOptions { TRANS ("OK"), 0 }.setRole (MessageBoxButtonRole::cancel));
             messageBox = AlertWindow::showScopedAsync (options, getAlertBoxResultChosen());
         }
         else if (type == binaryChoiceAlertWindow)
