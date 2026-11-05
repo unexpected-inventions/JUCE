@@ -86,6 +86,28 @@ accepts them too.
 
 ## Change
 
+A DropShadower now uses one window, or one child component, sitting behind its
+owner rather than four around it.
+
+**Possible Issues**
+
+Code that counts or searches the children of a component containing a
+DropShadower's owner will find one shadow component rather than four.
+
+**Workaround**
+
+Shadow components can be identified by their interceptsMouseClicks state
+rather than their number.
+
+**Rationale**
+
+The four windows were a relic of pre-rendered shadow images and software
+composited layered windows. A single window needs a quarter of the native
+window operations whenever its owner is shown, moved or reordered.
+
+
+## Change
+
 The default macOS and iOS deployment targets set by the Projucer have been
 increased to macOS 12.0 and iOS 15.0 respectively.
 
@@ -293,8 +315,7 @@ AlertWindow functions.
 
 The alert window is now kept above the window containing the component, and
 is minimised and restored with it. It also moves with that window, where a
-window can position itself. On macOS it takes that window's level, so it may be
-covered by an always-on-top window that would previously have been below it.
+window can position itself.
 
 **Workaround**
 

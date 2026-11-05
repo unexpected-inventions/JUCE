@@ -697,6 +697,7 @@ private:
         newWindow.rootViewController = controller;
         newWindow.hidden = ! isShowing();
         newWindow.opaque = component.isOpaque();
+        newWindow.userInteractionEnabled = (getStyleFlags() & windowIgnoresMouseClicks) == 0;
         newWindow.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent: 0];
 
         if (component.isAlwaysOnTop())
@@ -1993,6 +1994,7 @@ UIViewComponentPeer::UIViewComponentPeer (Component& comp,
     view = [[JuceUIView alloc] initWithOwner: this withFrame: r];
 
     view.multipleTouchEnabled = YES;
+    view.userInteractionEnabled = (getStyleFlags() & windowIgnoresMouseClicks) == 0;
     view.hidden = true;
     view.opaque = component.isOpaque();
     view.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent: 0];
