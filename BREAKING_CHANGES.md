@@ -4,6 +4,158 @@
 
 ## Change
 
+The deprecated function `MessageBoxOptions::makeOptionsYesNo` no longer
+produces a dialog that can be dismissed with 'escape' and confirmed with
+'return'.
+
+**Possible Issues**
+
+Programs that expect this behaviour will no longer function correctly.
+
+**Workaround**
+
+Build MessageBoxOptions manually, using `MessageBoxOptions::withButton` to add
+one button designated the preferred action, and one button with the cancel
+role.
+
+**Rationale**
+
+A yes/no choice has different semantics to OK/cancel. Unlike 'cancel',
+selecting 'no' may have some non-trivial effect. The box should not be
+dismissed with the escape key or other cancellation mechanisms ('back' on
+Android, alt+f4 on Windows), so that the user is required to explicitly select
+the negative option.
+
+
+# Version 9.0.5
+
+## Change
+
+ValueTree::readFromStream() and the related readFromData() and
+readFromGZIPData() functions now return an invalid ValueTree for data in
+which trees are nested more than 256 levels deep. var::readFromStream() now
+reads arrays nested more than 256 levels deep as void values.
+
+**Possible Issues**
+
+Such data, which can only have been produced by a tree or array that was
+itself nested more than 256 levels deep, will no longer be read back.
+
+**Workaround**
+
+Restructure the tree or array so that it is nested less deeply.
+
+**Rationale**
+
+Both readers recurse once for each level of nesting, so a malicious data block
+could use deep nesting to overflow the stack and crash an application. The
+limit matches the one applied to JSON and XML documents. The readers also no
+longer preallocate storage based on counts and sizes read from the data, which
+could previously be used to request a very large allocation.
+
+
+## Change
+
+JSON::parse() and JSON::fromString() now reject documents in which objects or
+arrays are nested more than 256 levels deep.
+
+**Possible Issues**
+
+Such documents will fail to parse. The Result returned by JSON::parse() will
+report "Objects or arrays are nested too deeply", and the other parsing
+functions will return a void var.
+
+**Workaround**
+
+Restructure the document so that it is nested less deeply.
+
+**Rationale**
+
+The parser recurses once for each level of nesting, so a malicious document
+could use deep nesting to overflow the stack and crash an application. The
+limit matches XmlDocument and sits within the range used by other JSON
+libraries, far beyond anything a real document needs.
+
+
+## Change
+
+On Windows, File::isAbsolutePath() now returns true for paths that start with
+a forward slash, and File::getChildFile() resolves a path that starts with a
+separator but doesn't name a drive or share against the drive or share of the
+file on which it is called, rather than against the current working directory's
+drive.
+
+**Possible Issues**
+
+Code that relied on File::isAbsolutePath() returning false for a path such as
+"/foo" on Windows will see different behaviour. For example, ZipFile will now
+refuse to extract entries whose names start with a forward slash on Windows,
+as it already did for entries starting with a backslash.
+
+Code calling getChildFile() with a path such as "\\foo.txt" on a File on a
+different drive to the current working directory will now receive a File on
+the same drive as the File on which getChildFile() was called.
+
+**Workaround**
+
+Resolve such paths explicitly against File::getCurrentWorkingDirectory() if
+the previous behaviour is required.
+
+**Rationale**
+
+A path starting with a separator but no drive is not relative, but it is also
+not fully specified. Previously, passing such a path to getChildFile() would
+trigger an assertion, and the result depended on the current working
+directory rather than on the File being used as the context. Forward slashes
+are accepted everywhere else in File on Windows, so isAbsolutePath() now
+accepts them too.
+
+
+## Change
+
+A DropShadower now uses one window, or one child component, sitting behind its
+owner rather than four around it.
+
+**Possible Issues**
+
+Code that counts or searches the children of a component containing a
+DropShadower's owner will find one shadow component rather than four.
+
+**Workaround**
+
+Shadow components can be identified by their interceptsMouseClicks state
+rather than their number.
+
+**Rationale**
+
+The four windows were a relic of pre-rendered shadow images and software
+composited layered windows. A single window needs a quarter of the native
+window operations whenever its owner is shown, moved or reordered.
+
+
+## Change
+
+The default macOS and iOS deployment targets set by the Projucer have been
+increased to macOS 12.0 and iOS 15.0 respectively.
+
+**Possible Issues**
+
+Projects using the Projucer's default minimum deployment target will have their
+minimum deployment target increased.
+
+**Workaround**
+
+If you need a lower minimum deployment target then you must set this in the
+Projucer's Xcode build configuration settings.
+
+**Rationale**
+
+Xcode 27 no longer supports deployment targets lower than macOS 12.0 and iOS
+15.0.
+
+
+## Change
+
 On Windows, native message boxes with three buttons, created using the
 MessageBoxOptions::withButton() builder, no longer have cancellation behaviour
 (where the box can be dismissed with alt+f4, escape, etc.) by default.
@@ -190,8 +342,7 @@ AlertWindow functions.
 
 The alert window is now kept above the window containing the component, and
 is minimised and restored with it. It also moves with that window, where a
-window can position itself. On macOS it takes that window's level, so it may be
-covered by an always-on-top window that would previously have been below it.
+window can position itself.
 
 **Workaround**
 
