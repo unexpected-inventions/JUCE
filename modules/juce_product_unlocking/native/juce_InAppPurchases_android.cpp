@@ -589,7 +589,7 @@ struct InAppPurchases::Pimpl
                           const String& subscriptionIdentifier,
                           bool creditForUnusedSubscription)
     {
-        productDetailsQueryCallbackQueue.emplace ([=] (LocalRef<jobject> productDetailsList)
+        productDetailsQueryCallbackQueue.emplace ([=, this] (LocalRef<jobject> productDetailsList)
         {
             if (productDetailsList != nullptr)
             {
@@ -649,7 +649,7 @@ struct InAppPurchases::Pimpl
     {
         if (purchaseToken.isEmpty())
         {
-            productDetailsQueryCallbackQueue.emplace ([=] (LocalRef<jobject> productDetailsList)
+            productDetailsQueryCallbackQueue.emplace ([=, this] (LocalRef<jobject> productDetailsList)
             {
                 if (productDetailsList != nullptr)
                 {
@@ -760,12 +760,12 @@ private:
 
     void queryProductDetailsAsync (const StringArray& productIdentifiers)
     {
-        Thread::launch ([=]
+        Thread::launch ([=, this]
         {
             if (! checkIsReady())
                 return;
 
-            MessageManager::callAsync ([=]
+            MessageManager::callAsync ([=, this]
             {
                 getEnv()->CallVoidMethod (billingClient,
                                           JuceBillingClient.queryProductDetails,
@@ -776,12 +776,12 @@ private:
 
     void getProductsBoughtAsync()
     {
-        Thread::launch ([=]
+        Thread::launch ([=, this]
         {
             if (! checkIsReady())
                 return;
 
-            MessageManager::callAsync ([=]
+            MessageManager::callAsync ([=, this]
             {
                 getEnv()->CallVoidMethod (billingClient,
                                           JuceBillingClient.queryPurchases);
@@ -824,7 +824,7 @@ private:
             return;
         }
 
-        purchasesListQueryCallbackQueue.emplace ([=] (LocalRef<jobject> purchasesList)
+        purchasesListQueryCallbackQueue.emplace ([=, this] (LocalRef<jobject> purchasesList)
         {
             if (purchasesList != nullptr)
             {

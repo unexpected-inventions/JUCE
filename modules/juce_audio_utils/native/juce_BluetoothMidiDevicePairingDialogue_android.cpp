@@ -218,6 +218,7 @@ public:
         setRowHeight (40);
         setModel (this);
         setOutlineThickness (1);
+        setColour (ListBox::outlineColourId, Colours::grey);
         startTimer (timerPeriodInMs);
     }
 
@@ -244,9 +245,9 @@ private:
             const AndroidBluetoothMidiDevice& device = devices.getReference (rowNumber);
             const String statusString (getDeviceStatusString (device.connectionStatus));
 
-            g.fillAll (Colours::white);
+            g.fillAll (Colours::lime.withAlpha (0.08f));
 
-            const float xmargin = 3.0f;
+            const float xmargin = 8.0f;
             const float ymargin = 3.0f;
             const float fontHeight = 0.4f * (float) height;
             const float deviceNameWidth = 0.6f * (float) width;
@@ -265,7 +266,7 @@ private:
                         Justification::topRight, true);
 
             g.setColour (Colours::grey);
-            g.drawHorizontalLine (height - 1, xmargin, (float) width);
+            g.drawHorizontalLine (height - 1, 0, (float) width);
         }
     }
 
@@ -293,15 +294,15 @@ private:
 
     static String getDeviceStatusString (DeviceStatus deviceStatus) noexcept
     {
-        if (deviceStatus == AndroidBluetoothMidiDevice::offline)        return "Offline";
-        if (deviceStatus == AndroidBluetoothMidiDevice::connected)      return "Connected";
-        if (deviceStatus == AndroidBluetoothMidiDevice::disconnected)   return "Not connected";
-        if (deviceStatus == AndroidBluetoothMidiDevice::connecting)     return "Connecting...";
-        if (deviceStatus == AndroidBluetoothMidiDevice::disconnecting)  return "Disconnecting...";
+        if (deviceStatus == AndroidBluetoothMidiDevice::offline)        return TRANS ("Offline");
+        if (deviceStatus == AndroidBluetoothMidiDevice::connected)      return TRANS ("Connected");
+        if (deviceStatus == AndroidBluetoothMidiDevice::disconnected)   return TRANS ("Not connected");
+        if (deviceStatus == AndroidBluetoothMidiDevice::connecting)     return TRANS ("Connecting...");
+        if (deviceStatus == AndroidBluetoothMidiDevice::disconnecting)  return TRANS ("Disconnecting...");
 
         // unknown device state!
         jassertfalse;
-        return "Status unknown";
+        return TRANS ("Status unknown");
     }
 
     //==============================================================================
@@ -425,17 +426,18 @@ public:
 
         AndroidBluetoothMidiInterface::startStopScan (true);
 
+        update();
+        
+        auto& desktop = Desktop::getInstance();
+        enabledOrientations = desktop.getOrientationsEnabled();
+        desktop.setOrientationsEnabled (desktop.getCurrentOrientation());
+        
+        // addToDesktop (ComponentPeer::windowHasDropShadow);
+        desktop.getComponent(0)->getTopLevelComponent()->addChildComponent (this);
+    
+        toFront (true);
         setAlwaysOnTop (true);
         setVisible (true);
-        addToDesktop (ComponentPeer::windowHasDropShadow);
-
-        if (bounds.isEmpty())
-            setBounds (0, 0, getParentWidth(), getParentHeight());
-        else
-            setBounds (bounds);
-
-        toFront (true);
-        setOpaque (! bounds.isEmpty());
 
         addAndMakeVisible (bluetoothDevicesList);
         enterModalState (true, exitCallback.release(), true);
@@ -443,29 +445,28 @@ public:
 
     ~BluetoothMidiSelectorOverlay() override
     {
+        Desktop::getInstance().setOrientationsEnabled (enabledOrientations);
         AndroidBluetoothMidiInterface::startStopScan (false);
     }
 
     void paint (Graphics& g) override
     {
-        g.fillAll (bounds.isEmpty() ? Colours::black.withAlpha (0.6f) : Colours::black);
-
-        g.setColour (Colour (0xffdfdfdf));
+        g.setColour (Colours::white);
         Rectangle<int> overlayBounds = getOverlayBounds();
         g.fillRect (overlayBounds);
 
         g.setColour (Colours::black);
-        g.setFont (16);
-        g.drawText ("Bluetooth MIDI Devices",
-                    overlayBounds.removeFromTop (20).reduced (3, 3),
+        g.setFont (FontOptions (20, Font::bold));
+        g.drawText (TRANS ("Bluetooth MIDI Devices"),
+                    overlayBounds.removeFromTop (20).reduced (8, 5),
                     Justification::topLeft, true);
 
         overlayBounds.removeFromTop (2);
 
-        g.setFont (12);
-        g.drawText ("tap to connect/disconnect",
-                    overlayBounds.removeFromTop (18).reduced (3, 3),
-                    Justification::topLeft, true);
+        g.setFont (18);
+        g.drawFittedText (TRANS ("Note: use this to connect to musical instruments. Please use OSC to connect to computers or mobile devices."),
+                    overlayBounds.removeFromTop (80).reduced (8, 5),
+                    Justification::topLeft, 3);
     }
 
     void inputAttemptWhenModal() override           { exitModalState (0); }
@@ -484,23 +485,20 @@ private:
         else
             setBounds (bounds);
 
-        bluetoothDevicesList.setBounds (getOverlayBounds().withTrimmedTop (40));
+        bluetoothDevicesList.setBounds (getOverlayBounds().withTrimmedTop (90));
     }
 
     Rectangle<int> getOverlayBounds() const noexcept
     {
-        if (bounds.isEmpty())
-        {
-            const int pw = getParentWidth();
-            const int ph = getParentHeight();
-
-            return Rectangle<int> (pw, ph).withSizeKeepingCentre (jmin (400, pw - 14),
-                                                                  jmin (300, ph - 40));
-        }
-
-        return bounds.withZeroOrigin();
+        const int w = getWidth();
+        const int h = getHeight();
+        
+        return Rectangle<int> (w, h).withSizeKeepingCentre (jmin (400, w - 14),
+                                                            jmin (300, h - 40));
     }
 
+    Component* kioskModeComponent;
+    int enabledOrientations;
     AndroidBluetoothMidiDevicesListBox bluetoothDevicesList;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BluetoothMidiSelectorOverlay)

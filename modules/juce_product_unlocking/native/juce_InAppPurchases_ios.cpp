@@ -57,7 +57,15 @@ struct InAppPurchases::Pimpl
         Status getStatus()         const override  { return SKDownloadStateToDownloadStatus (download.state); }
 
       #if JUCE_IOS
-        int64 getContentLength()   const override  { return download.contentLength; }
+        int64 getContentLength()   const override
+        {
+            if (@available(iOS 13.0, *))
+                return download.expectedContentLength;
+            
+            JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wdeprecated-declarations")
+            return download.contentLength;
+            JUCE_END_IGNORE_WARNINGS_GCC_LIKE
+        }
       #else
         int64 getContentLength() const override
         {
@@ -113,7 +121,7 @@ struct InAppPurchases::Pimpl
             for (SKDownload* d in transaction.downloads)
             {
                 SKDownloadState state = d.state;
-
+                
                 if (state != SKDownloadStateFinished
                      && state != SKDownloadStateFailed
                      && state != SKDownloadStateCancelled)

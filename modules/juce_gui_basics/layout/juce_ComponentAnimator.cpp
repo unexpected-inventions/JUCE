@@ -264,7 +264,7 @@ void ComponentAnimator::animateComponent (Component* const component,
         if (! isTimerRunning())
         {
             lastTime = Time::getMillisecondCounter();
-            startTimerHz (50);
+            startTimerHz (60);
         }
     }
 }

@@ -1094,6 +1094,8 @@ private:
 
         // Silences warning when Google Play Billing v7 is enabled
         result << "android.useAndroidX=true" << newLine;
+        result << "org.gradle.jvmargs=-Xmx4096m" << newLine;
+        result << "android.javaCompile.suppressSourceTargetDeprecationWarning=true" << newLine;
 
         return replaceLineFeeds (result, getNewLineString());
     }
@@ -1433,9 +1435,10 @@ private:
             device->setAttribute ("manufacturer", project.getCompanyNameString());
             device->setAttribute ("product", projectName);
 
-            const auto deviceName = (project.getCompanyNameString().isNotEmpty() ? (project.getCompanyNameString() + " ") : "")
-                                  + projectName;
-            device->setAttribute ("name", deviceName);
+//            const auto deviceName = (project.getCompanyNameString().isNotEmpty() ? (project.getCompanyNameString() + " ") : "")
+//                                  + projectName;
+            device->setAttribute ("name", projectName); // deviceName
+
             return device;
         };
 

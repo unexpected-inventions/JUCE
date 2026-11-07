@@ -606,10 +606,14 @@ void GlyphArrangement::justifyGlyphs (int startIndex, int num,
         auto bb = getBoundingBox (startIndex, num, ! justification.testFlags (Justification::horizontallyJustified
                                                                                | Justification::horizontallyCentred));
         float deltaX = x, deltaY = y;
-
+        auto font = glyphs.getLast().font;
+        auto kerningOfLastGlyph = font.getExtraKerningFactor() * font.getHeight() * font.getHorizontalScale();
+        
         if (justification.testFlags (Justification::horizontallyJustified))     deltaX -= bb.getX();
-        else if (justification.testFlags (Justification::horizontallyCentred))  deltaX += (width - bb.getWidth()) * 0.5f - bb.getX();
-        else if (justification.testFlags (Justification::right))                deltaX += width - bb.getRight();
+        else if (justification.testFlags (Justification::horizontallyCentred))  deltaX += (width - bb.getWidth()) * 0.5f - bb.getX() 
+                                                                                          + kerningOfLastGlyph * 0.5f;
+        else if (justification.testFlags (Justification::right))                deltaX += width - bb.getRight()
+                                                                                          + kerningOfLastGlyph;
         else                                                                    deltaX -= bb.getX();
 
         if (justification.testFlags (Justification::top))                       deltaY -= bb.getY();

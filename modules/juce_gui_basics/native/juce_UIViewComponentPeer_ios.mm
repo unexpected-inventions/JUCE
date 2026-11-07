@@ -697,6 +697,7 @@ private:
         newWindow.rootViewController = controller;
         newWindow.hidden = ! isShowing();
         newWindow.opaque = component.isOpaque();
+        newWindow.userInteractionEnabled = (getStyleFlags() & windowIgnoresMouseClicks) == 0;
         newWindow.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent: 0];
 
         if (component.isAlwaysOnTop())
@@ -803,6 +804,16 @@ MultiTouchMapper<UITouch*> UIViewComponentPeer::currentTouches;
     {
         sendScreenBoundsUpdate (self);
     }];
+    
+// Fix for some artifacts when rotating the device on iOS 15
+    if (auto* peer = getViewPeer (self))
+    {
+        peer->setBounds ({(int)size.width, (int)size.height}, true);
+        peer->handleScreenSizeChange();
+        auto b = peer->getNonFullScreenBounds();
+        peer->setNonFullScreenBounds ({b.getHeight(), b.getWidth()});
+    }
+// ——————————————————————————————————————————————————————————
 }
 
 - (BOOL) prefersStatusBarHidden
@@ -1983,6 +1994,7 @@ UIViewComponentPeer::UIViewComponentPeer (Component& comp,
     view = [[JuceUIView alloc] initWithOwner: this withFrame: r];
 
     view.multipleTouchEnabled = YES;
+    view.userInteractionEnabled = (getStyleFlags() & windowIgnoresMouseClicks) == 0;
     view.hidden = true;
     view.opaque = component.isOpaque();
     view.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent: 0];
@@ -2167,17 +2179,25 @@ void UIViewComponentPeer::updateScreenBounds()
     {
         auto newDesktop = desktop.getDisplays().getPrimaryDisplay()->userBounds.getSmallestIntegerContainer();
 
-        if (newDesktop != oldDesktop)
+        NSOperatingSystemVersion ver = { 16, 0, 0 };
+        if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion: ver])
         {
-            // this will re-centre the window, but leave its size unchanged
+            if (newDesktop != oldDesktop)
+            {
+                // this will re-centre the window, but leave its size unchanged
 
-            auto centreRelX = (float) oldArea.getCentreX() / (float) oldDesktop.getWidth();
-            auto centreRelY = (float) oldArea.getCentreY() / (float) oldDesktop.getHeight();
+                auto centreRelX = (float) oldArea.getCentreX() / (float) oldDesktop.getWidth();
+                auto centreRelY = (float) oldArea.getCentreY() / (float) oldDesktop.getHeight();
 
-            auto x = ((int) ((float) newDesktop.getWidth()  * centreRelX)) - (oldArea.getWidth()  / 2);
-            auto y = ((int) ((float) newDesktop.getHeight() * centreRelY)) - (oldArea.getHeight() / 2);
+                auto x = ((int) ((float) newDesktop.getWidth()  * centreRelX)) - (oldArea.getWidth()  / 2);
+                auto y = ((int) ((float) newDesktop.getHeight() * centreRelY)) - (oldArea.getHeight() / 2);
 
-            component.setBounds (oldArea.withPosition (x, y));
+                component.setBounds (oldArea.withPosition (x, y));
+            }
+        }
+        else
+        {
+            component.setBounds (newDesktop); // fix for rotation issue as suggested by peteatjuce
         }
     }
 

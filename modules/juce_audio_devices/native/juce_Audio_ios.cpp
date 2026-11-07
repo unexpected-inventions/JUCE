@@ -350,7 +350,7 @@ struct iOSAudioIODevice::Pimpl final : public AsyncUpdater
         // We need to activate the audio session here to obtain the available sample rates and buffer sizes,
         // but if we don't set a category first then background audio will always be stopped. This category
         // may be changed later.
-        setAudioSessionCategory (AVAudioSessionCategoryPlayAndRecord);
+        setAudioSessionCategory (AVAudioSessionCategoryPlayback);
 
         setAudioSessionActive (true);
         updateHardwareInfo();
@@ -367,20 +367,34 @@ struct iOSAudioIODevice::Pimpl final : public AsyncUpdater
         close();
     }
 
+    inline static bool bluetoothLowLatencyEnabled;
+    
+    bool enableBluetoothSCO (bool enable)
+    {
+        bluetoothLowLatencyEnabled = enable;
+        return true;
+    }
+
     static void setAudioSessionCategory (NSString* category)
     {
+//        bool bluetooth = false;
+//        
+//        for (AVAudioSessionPortDescription* port in [AVAudioSession sharedInstance].currentRoute.outputs)
+//            if ([port.portType containsString: @"Bluetooth"])
+//                bluetooth = true;
+        
         NSUInteger options = 0;
 
        #if ! JUCE_DISABLE_AUDIO_MIXING_WITH_OTHER_APPS
-        options |= AVAudioSessionCategoryOptionMixWithOthers; // Alternatively AVAudioSessionCategoryOptionDuckOthers
+        options |= AVAudioSessionCategoryOptionMixWithOthers;
        #endif
 
         if (category == AVAudioSessionCategoryPlayAndRecord)
         {
            #if JUCE_IOS_API_VERSION_CAN_BE_BUILT (26, 0)
-            constexpr auto bluetoothOption = AVAudioSessionCategoryOptionAllowBluetoothHFP;
+            auto bluetoothOption = bluetoothLowLatencyEnabled ? AVAudioSessionCategoryOptionAllowBluetoothHFP : 0;
            #else
-            constexpr auto bluetoothOption = AVAudioSessionCategoryOptionAllowBluetooth;
+            auto bluetoothOption = bluetoothLowLatencyEnabled ? AVAudioSessionCategoryOptionAllowBluetooth : 0;
            #endif
 
             options |= AVAudioSessionCategoryOptionDefaultToSpeaker
@@ -706,9 +720,10 @@ struct iOSAudioIODevice::Pimpl final : public AsyncUpdater
                             << ", targetSampleRate: " << targetSampleRate
                             << ", targetBufferSize: " << targetBufferSize);
 
-        setAudioSessionActive (true);
+        setAudioSessionActive (false);
         setAudioSessionCategory (requestedInputChannels > 0 ? AVAudioSessionCategoryPlayAndRecord
                                                             : AVAudioSessionCategoryPlayback);
+        setAudioSessionActive (true);
         channelData.reconfigure (requestedInputChannels, requestedOutputChannels);
         setTargetSampleRateAndBufferSize();
         updateHardwareInfo (true);
@@ -1650,6 +1665,7 @@ Array<double> iOSAudioIODevice::getAvailableSampleRates()           { return pim
 Array<int> iOSAudioIODevice::getAvailableBufferSizes()              { return pimpl->availableBufferSizes; }
 
 bool iOSAudioIODevice::setAudioPreprocessingEnabled (bool enabled)  { return pimpl->setAudioPreprocessingEnabled (enabled); }
+bool iOSAudioIODevice::enableBluetoothSCO (bool enabled)            { return pimpl->enableBluetoothSCO (enabled); }
 
 bool iOSAudioIODevice::isPlaying()                                  { return pimpl->isRunning && pimpl->callback != nullptr; }
 bool iOSAudioIODevice::isOpen()                                     { return pimpl->isRunning; }

@@ -257,7 +257,7 @@ namespace juce::LiveConstantEditor
 #endif
 
 //==============================================================================
-#if JUCE_ENABLE_LIVE_CONSTANT_EDITOR || DOXYGEN
+#if (JUCE_ENABLE_LIVE_CONSTANT_EDITOR || DOXYGEN) && ! (JUCE_IOS || JUCE_ANDROID)
  /**
     This macro wraps a primitive constant value in some cunning boilerplate code that allows
     its value to be interactively tweaked in a popup window while your application is running.
@@ -306,7 +306,11 @@ namespace juce::LiveConstantEditor
  */
  #define JUCE_LIVE_CONSTANT(initialValue) \
     (juce::LiveConstantEditor::getValue (__FILE__, __LINE__ - 1, initialValue).get())
+ #define JLC(initialValue) \
+    (juce::LiveConstantEditor::getValue (__FILE__, __LINE__ - 1, initialValue).get())
 #else
  #define JUCE_LIVE_CONSTANT(initialValue) \
+    (initialValue)
+ #define JLC(initialValue) \
     (initialValue)
 #endif

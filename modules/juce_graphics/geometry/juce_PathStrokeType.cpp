@@ -722,6 +722,10 @@ void PathStrokeType::createDashedStroke (Path& destPath,
     int dashNum = positionInDashArray.startIndex;
     float pos = -positionInDashArray.lengthReductionForFirstDash, lineLen = 0.0f, lineEndPos = 0.0f;
     float dx = 0.0f, dy = 0.0f;
+    
+    // NOTE: The following changes fix the incorrect drawing of a solid line between segmented paths
+    float prevX = 0.0f, prevY = 0.0f;
+    bool firstIteration = true;
 
     for (;;)
     {
@@ -745,6 +749,15 @@ void PathStrokeType::createDashedStroke (Path& destPath,
                 return;
             }
 
+            if (!firstIteration && (approximatelyEqual (it.x1, prevX) || approximatelyEqual (it.y1, prevY)))
+            {
+                dashNum = 0;
+                pos = 0.0f;
+                lineEndPos = 0.0f;
+                first = true;
+            }
+            firstIteration = false;
+
             if (isSolid)
             {
                 if (first)
@@ -758,6 +771,9 @@ void PathStrokeType::createDashedStroke (Path& destPath,
             lineLen = juce_hypot (dx, dy);
             lineEndPos += lineLen;
             first = it.closesSubPath;
+            
+            prevX = it.x2;
+            prevY = it.y2;
         }
 
         const float alpha = (pos - (lineEndPos - lineLen)) / lineLen;

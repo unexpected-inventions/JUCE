@@ -42,25 +42,37 @@ class BluetoothMidiSelectorOverlay final : public Component
 {
 public:
     BluetoothMidiSelectorOverlay (ModalComponentManager::Callback* exitCallbackToUse,
-                                  const Rectangle<int>& boundsToUse)
+                                  const Rectangle<int>& boundsToUse,
+                                  bool advertiseAlsPeriferal)
         : bounds (boundsToUse)
     {
         std::unique_ptr<ModalComponentManager::Callback> exitCallback (exitCallbackToUse);
 
-        setAlwaysOnTop (true);
-        setVisible (true);
-        addToDesktop (ComponentPeer::windowHasDropShadow);
+        update(); // sets bounds
 
-        if (bounds.isEmpty())
-            setBounds (0, 0, getParentWidth(), getParentHeight());
+        kioskModeComponent = Desktop::getInstance().getKioskModeComponent();
+
+        if (kioskModeComponent != nullptr)
+            kioskModeComponent->addChildComponent (this);
         else
-            setBounds (bounds);
+            addToDesktop (ComponentPeer::windowHasDropShadow);
 
         toFront (true);
-        setOpaque (true);
+        setAlwaysOnTop (true);
+        setVisible (true);
 
-        controller = [[CABTMIDICentralViewController alloc] init];
-        nativeSelectorComponent.setView ([controller view]);
+        usePeripheralController = advertiseAlsPeriferal;
+
+        if (usePeripheralController)
+        {
+            peripheralController = [[CABTMIDILocalPeripheralViewController alloc] init];
+            nativeSelectorComponent.setView ([peripheralController view]);
+        }
+        else
+        {
+            centralController = [[CABTMIDICentralViewController alloc] init];
+            nativeSelectorComponent.setView ([centralController view]);
+        }
 
         addAndMakeVisible (nativeSelectorComponent);
 
@@ -70,25 +82,32 @@ public:
     ~BluetoothMidiSelectorOverlay() override
     {
         nativeSelectorComponent.setView (nullptr);
-        [controller release];
+        
+        if (usePeripheralController)
+            [peripheralController release];
+        else
+            [centralController release];
     }
 
-    void paint (Graphics& g) override
-    {
-        g.fillAll (bounds.isEmpty() ? Colours::black.withAlpha (0.5f) : Colours::black);
-    }
+//    void paint (Graphics& g) override
+//    {
+//        g.fillAll (getLookAndFeel().findColour (juce::ResizableWindow::backgroundColourId).withAlpha (0.7f));
+//        g.fillAll (Colours::black.withAlpha (0.25f));
+//    }
 
     void inputAttemptWhenModal() override           { close(); }
     void mouseDrag (const MouseEvent&) override     {}
     void mouseDown (const MouseEvent&) override     { close(); }
-    void resized() override                         { update(); }
-    void parentSizeChanged() override               { update(); }
+    void resized() override                         { close(); }
+    void parentSizeChanged() override               { close(); }
 
 private:
     void update()
     {
         if (bounds.isEmpty())
         {
+            setBounds (0, 0, getParentWidth(), getParentHeight());
+            
             const int pw = getParentWidth();
             const int ph = getParentHeight();
 
@@ -111,22 +130,26 @@ private:
         setVisible (false);
     }
 
-    CABTMIDICentralViewController* controller;
+    bool usePeripheralController = false;
+    CABTMIDICentralViewController* centralController;
+    CABTMIDILocalPeripheralViewController* peripheralController;
     UIViewComponent nativeSelectorComponent;
     Rectangle<int> bounds;
+    Component* kioskModeComponent;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BluetoothMidiSelectorOverlay)
 };
 
 bool BluetoothMidiDevicePairingDialogue::open (ModalComponentManager::Callback* exitCallback,
-                                               Rectangle<int>* btBounds)
+                                               Rectangle<int>* btBounds,
+                                               bool advertiseAlsPeriferal)
 {
     std::unique_ptr<ModalComponentManager::Callback> cb (exitCallback);
     auto boundsToUse = (btBounds != nullptr ? *btBounds : Rectangle<int> {});
 
     if (isAvailable())
     {
-        new BluetoothMidiSelectorOverlay (cb.release(), boundsToUse);
+        new BluetoothMidiSelectorOverlay (cb.release(), boundsToUse, advertiseAlsPeriferal);
         return true;
     }
 

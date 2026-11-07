@@ -511,6 +511,11 @@ private:
                                  + "\ngetDeviceId = " + String (stream->getDeviceId()));
             }
         }
+        
+        void stop() // <-----
+        {
+            close();
+        }
 
         std::shared_ptr<oboe::AudioStream> getNativeStream() const
         {
@@ -546,7 +551,17 @@ private:
 
             if (deviceId != -1)
                 builder.setDeviceId (deviceId);
-
+                
+             auto scoState = getBluetoothScoState(); // <-----
+            
+             if (scoState == "connected" || scoState == "connecting") // <-----
+             {
+                 builder.setFormatConversionAllowed (true);
+            
+                 if (getAndroidSDKVersion() >= 28)
+                     builder.setUsage (oboe::Usage::VoiceCommunication);
+             }
+                                    
             // Note: letting OS to choose the buffer capacity & frames per callback.
             builder.setDirection (direction);
             builder.setSharingMode (sharingMode);
@@ -554,6 +569,7 @@ private:
             builder.setFormat (format);
             builder.setSampleRate (newSampleRate);
             builder.setPerformanceMode (oboe::PerformanceMode::LowLatency);
+            builder.setFramesPerDataCallback (oboe::DefaultStreamValues::FramesPerBurst); // <-----
 
            #if JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK
             if (newCallback != nullptr)
@@ -984,7 +1000,7 @@ private:
             inputStream = nullptr;
             outputStream = nullptr;
         }
-
+        
         std::vector<SampleType> inputStreamNativeBuffer;
         AudioBuffer<float> inputStreamSampleBuffer,
                            outputStreamSampleBuffer;
@@ -1069,7 +1085,7 @@ public:
     }
 
     //==============================================================================
-    void scanForDevices() override {}
+    void scanForDevices() override { checkAvailableDevices(); } // <-----
 
     StringArray getDeviceNames (bool wantInputNames) const override
     {
@@ -1134,19 +1150,39 @@ public:
     }
 
  private:
+    bool offCallSCOisSupported = false; // <-----
+ 
     void checkAvailableDevices()
     {
+        auto currentDevices = [&] () // <-----
+        {
+            StringArray names;
+        
+            for (auto& device : outputDevices)
+                names.add (device.name);
+                
+            for (auto& device : inputDevices)
+                names.add (device.name);    
+                
+            return names;
+        };
+        
+        auto previousDevices = currentDevices(); // <-----
+        
+        inputDevices.clear(); // <-----
+        outputDevices.clear(); // <-----
+        
         auto sampleRates = OboeAudioIODevice::getDefaultSampleRates();
 
-        inputDevices .add ({ "System Default (Input)",  oboe::kUnspecified, sampleRates, 1 });
-        outputDevices.add ({ "System Default (Output)", oboe::kUnspecified, sampleRates, 2 });
+        inputDevices .add ({ "System Default (Input)",  oboe::kUnspecified, oboe::kUnspecified, sampleRates, 1 }); // <-----
+        outputDevices.add ({ "System Default (Output)", oboe::kUnspecified, oboe::kUnspecified, sampleRates, 2 }); // <-----
 
         if (! supportsDevicesInfo())
             return;
 
         auto* env = getEnv();
 
-        LocalRef<jclass> audioManagerClass { env->FindClass ("android/media/AudioManager") };
+        LocalRef<jclass> audioManagerClass { env->FindClass ("android/media/AudioManager") }; // <-----
 
         // We should be really entering here only if API supports it.
         jassert (audioManagerClass != nullptr);
@@ -1167,31 +1203,46 @@ public:
                                                                                      allDevices));
 
         const int numDevices = env->GetArrayLength (devices.get());
+        
+        offCallSCOisSupported = env->CallBooleanMethod (audioManager, AndroidAudioManager.isBluetoothScoAvailableOffCall); // <-----
 
         for (int i = 0; i < numDevices; ++i)
         {
             auto device = LocalRef<jobject> ((jobject) env->GetObjectArrayElement (devices.get(), i));
             addDevice (device, env);
         }
-
-        JUCE_OBOE_LOG ("-----InputDevices:");
-
-        for ([[maybe_unused]] auto& device : inputDevices)
+        
+        [[maybe_unused]] auto sampleRatesToString = [] (Array<int> sampleRatesToConvert) // <-----
         {
-            JUCE_OBOE_LOG ("name = " << device.name);
-            JUCE_OBOE_LOG ("id = " << String (device.id));
-            JUCE_OBOE_LOG ("sample rates size = " << String (device.sampleRates.size()));
-            JUCE_OBOE_LOG ("num channels = " + String (device.numChannels));
-        }
-
-        JUCE_OBOE_LOG ("-----OutputDevices:");
-
-        for ([[maybe_unused]] auto& device : outputDevices)
+            String sampleRatesString;
+        
+            for (auto r : sampleRatesToConvert)
+                sampleRatesString = sampleRatesString << String (r) << " ";
+                
+            return sampleRatesString;
+        };
+        
+        if (previousDevices != currentDevices()) // <-----
         {
-            JUCE_OBOE_LOG ("name = " << device.name);
-            JUCE_OBOE_LOG ("id = " << String (device.id));
-            JUCE_OBOE_LOG ("sample rates size = " << String (device.sampleRates.size()));
-            JUCE_OBOE_LOG ("num channels = " + String (device.numChannels));
+            JUCE_OBOE_LOG ("-----InputDevices:");
+
+            for ([[maybe_unused]] auto& device : inputDevices)
+            {
+                JUCE_OBOE_LOG ("name = " << device.name);
+                JUCE_OBOE_LOG ("id = " << String (device.id));
+                JUCE_OBOE_LOG ("sample rates = " << sampleRatesToString (device.sampleRates));
+                JUCE_OBOE_LOG ("num channels = " + String (device.numChannels));
+            }
+
+            JUCE_OBOE_LOG ("-----OutputDevices:");
+
+            for ([[maybe_unused]] auto& device : outputDevices)
+            {
+                JUCE_OBOE_LOG ("name = " << device.name);
+                JUCE_OBOE_LOG ("id = " << String (device.id));
+                JUCE_OBOE_LOG ("sample rates = " << sampleRatesToString (device.sampleRates));
+                JUCE_OBOE_LOG ("num channels = " + String (device.numChannels));
+            }
         }
     }
 
@@ -1204,21 +1255,20 @@ public:
     {
         LocalRef<jclass> deviceClass { env->FindClass ("android/media/AudioDeviceInfo") };
 
-        jmethodID getProductNameMethod = env->GetMethodID (deviceClass, "getProductName",
-                                                           "()Ljava/lang/CharSequence;");
-
+        jmethodID getProductNameMethod   = env->GetMethodID (deviceClass, "getProductName", "()Ljava/lang/CharSequence;");
         jmethodID getTypeMethod          = env->GetMethodID (deviceClass, "getType", "()I");
         jmethodID getIdMethod            = env->GetMethodID (deviceClass, "getId", "()I");
         jmethodID getSampleRatesMethod   = env->GetMethodID (deviceClass, "getSampleRates", "()[I");
         jmethodID getChannelCountsMethod = env->GetMethodID (deviceClass, "getChannelCounts", "()[I");
         jmethodID isSourceMethod         = env->GetMethodID (deviceClass, "isSource", "()Z");
 
-        auto deviceTypeString = deviceTypeToString (env->CallIntMethod (device, getTypeMethod));
+        auto deviceTypeInt = env->CallIntMethod (device, getTypeMethod);
+        auto deviceTypeString = deviceTypeToString (deviceTypeInt);
 
         if (deviceTypeString.isEmpty()) // unknown device
             return;
 
-        auto name = juceString ((jstring) env->CallObjectMethod (device, getProductNameMethod)) + " " + deviceTypeString;
+        auto name = juceString ((jstring) env->CallObjectMethod (device, getProductNameMethod)) + " - " + deviceTypeString;
         auto id = env->CallIntMethod (device, getIdMethod);
 
         auto jSampleRates = LocalRef<jintArray> ((jintArray) env->CallObjectMethod (device, getSampleRatesMethod));
@@ -1231,10 +1281,10 @@ public:
         auto isInput  = env->CallBooleanMethod (device, isSourceMethod);
         auto& devices = isInput ? inputDevices : outputDevices;
 
-        devices.add ({ name, id, sampleRates, numChannels });
+        devices.add ({ name, deviceTypeInt, id, sampleRates, numChannels });
     }
 
-    static String deviceTypeToString (int type)
+    String deviceTypeToString (int type)
     {
         switch (type)
         {
@@ -1245,7 +1295,8 @@ public:
             case 4:   return "wired headphones";
             case 5:   return "line analog";
             case 6:   return "line digital";
-            case 7:   return "Bluetooth device typically used for telephony";
+            case 7:   return offCallSCOisSupported ? "Bluetooth device supporting SCO for off call use cases"
+                                                   : "Bluetooth device typically used for telephony";
             case 8:   return "Bluetooth device supporting the A2DP profile";
             case 9:   return "HDMI";
             case 10:  return "HDMI audio return channel";
@@ -1292,9 +1343,10 @@ public:
     struct DeviceInfo
     {
         String name;
+        int type = 0;
         int id = -1;
         Array<int> sampleRates;
-        int numChannels;
+        int numChannels = 0;
     };
 
     DeviceInfo getDeviceInfoForName (const String& name, bool isInput)

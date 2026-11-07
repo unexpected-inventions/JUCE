@@ -123,11 +123,15 @@
 #if JUCE_MAC || JUCE_IOS
  #include <xlocale.h>
  #include <mach/mach.h>
+ #include <cxxabi.h>
 #endif
 
 #if JUCE_ANDROID
  #include <ifaddrs.h>
  #include <android/log.h>
+ #include <unwind.h>
+ #include <dlfcn.h>
+ #include <cxxabi.h>
 #endif
 
 #undef check
