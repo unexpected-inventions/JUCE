@@ -72,7 +72,8 @@
     exact area elsewhere.
     - Text matches CoreGraphics to the pixel: same rasteriser, and glyphs placed as CoreGraphics
       places them in a window (x rounded down to 1/16 px, baseline rounded up to a whole pixel).
-    - Gradients interpolate their stops as CGGradient does (float components, not premultiplied).
+    - Gradients interpolate their stops as CGGradient does (float components, not premultiplied),
+      and are dithered the way it dithers them (see gradientDither).
     - Straight edges at any angle match CoreGraphics (both are the exact area).
     - Curves and rotated boxes: CoreGraphics strays from the exact area by ~12/255 RMS on their
       edges (its flattening, measured), JUCE's software renderer by a few levels (0.55 cubics);
@@ -416,9 +417,69 @@ float twoPointConicalWeight (float2 q, float4 conic, thread bool& valid)
     return swapped ? 1.0 - t : t;
 }
 
+// Gradients are dithered as CoreGraphics dithers a CGGradient, so that a long low-contrast ramp
+// doesn't show its 1/255 steps as bands, nor a fade to transparent its alpha steps. Measured on
+// CoreGraphics (macOS 13, captures of opaque and translucent ramps over a neutral background):
+// - ordered 32 x 32 blue-noise matrices anchored to device pixels, the same on every draw;
+// - offsets with a triangular distribution (TPDF) over +-1/255 (standard deviation 0.41/255);
+// - added to the colour before it is premultiplied, so the noise in the result scales with alpha;
+// - an independent matrix per channel: red, green and blue are uncorrelated;
+// - translucent ramps carry more noise than the colour's alone, which an independent alpha
+//   offset of half the amplitude reproduces (fitted: the noise of five ramps within 0.06/255).
+// Skia, Chrome and WebRender dither too, but with one 8 x 8 Bayer matrix of uniform offsets within
+// +-0.5/255, added to the premultiplied colour and not to the alpha: this renderer follows
+// CoreGraphics, whose interpolation it already matches.
+// The matrix is not CoreGraphics' own: it is a void-and-cluster one (Ulichney 1993, Gaussian
+// sigma 1.5 on a 32 x 32 torus), read at a different offset for each channel (measured
+// correlation between them: at most 0.06). Its ranks are mapped through the triangular
+// distribution's inverse CDF, which keeps the blue-noise order.
+constant ushort gradientDither[1024] =
+{
+     896,  515,  189,  294,  915,  454,  342,  597,  396,  785,  976,  323,   11,  848,  275,  802,  139,  297,  494,   88,  654,  293,  826,  398,  719,  634,  170,  690,  877,  451,  980,  360,
+      99,  737,  401,   40,  558,  159,  994,   36,  916,  497,  112,  879,  717,  464,  968,  377,  575,  991,  193,  794,  551, 1002,  158,   62,  893,  549,  343,    2,  590,  270,   59,  666,
+     286,  592,  934,  843,  670,  791,  231,  687,  307,  181,  632,  246,  559,  133,  207,  659,   77,  713,  432,  886,  239,  350,  509,  765,  444,  276, 1016,  757,  381,  918,  521,  799,
+    1000,  172,  480,  114,  336,  506,  413,  856,  531,  754,  433, 1015,  379,  773,  906,  490,  838,  341,   16,  619,  115,  701,  910,  625,  197,  109,  840,  496,  150,  703,  210,  435,
+      21,  365,  715,  243,  973,    9,  620,  129,  942,   81,  822,   30,  685,  303,   56,  606,  259,  948,  751,  479,  971,  404,   34,  310,  962,  571,  667,  247,  955,   80,  602,  860,
+     548,  920,  627,  800,  555,  880,  206,  711,  273,  361,  581,  219,  858,  460,  989,  392,  135,  535,  205,  298,  781,  178,  850,  489,  797,  393,   26,  332,  819,  406,  760,  316,
+     730,  136,  421,   64,  295,  748,  373,  999,  468,  660,  925,  507,  119,  635,  186,  727,  887,  640,  830,   82,  600,  522,  671,  244,   86,  716,  937,  615,  481,  162,  987,  237,
+     485,  839,  208,  985,  461,  147,  518,  813,   48,  163,  750,  289,  961,  348,  808,  500,   43,  334,  439, 1021,  369,  883,  122,  988,  347,  512,  180,  855,   72,  673,  574,   49,
+     952,  681,  346,  593,  894,  675,   79,  587,  257,  876,  409,    3,  677,  569,  100,  272,  967,  692,  161,  721,    6,  271,  446,  747,  584,  888,  274,  431,  742,  305,  884,  390,
+     280,  550,   15,  780,  248,  400,  857,  338,  949,  633,  533,  793,  226,  907,  437,  837,  543,  218,  921,  487,  806,  649,  917,  211,   35,  792,  125, 1014,  532,  200,  772,  128,
+     809,  177,  927,  492,  103, 1020,  202,  758,  455,  106,  315, 1009,  134,  372,  752,   23,  624,  397,   71,  588,  333,  154,  547,  405,  693,  463,  639,  364,    5,  941,  456,  628,
+    1003,  423,  734,  320,  621,  718,  544,   24,  662,  183,  854,  469,  699,  589,  194,  997,  309,  878,  784,  233,  964,  844,   67,  993,  291,  932,  238,  814,  582,  704,  345,   53,
+     216,  656,   65,  882,  166,  447,  281,  827,  981,  403,  733,   89,  268,  919,  449,  683,  157,  493,  710,  107,  452,  631,  357,  767,  141,  563,   69,  903,  155,  263,  864,  513,
+     899,  301,  553,  391,  790,  946,   78,  367,  567,  254,  609,  956,  519,   50,  331,  824,   66,  944,  362,  573,  278,  739,  198,  482,  866,  387,  736,  504,  430,  783,  108,  599,
+     148,  741,  982,  249,  121,  669,  508,  890,  140,  804,   18,  355,  755,  861,  642,  530,  260,  614,  187,  818, 1013,   47,  909,  583,   19,  648,  215, 1001,  317,  665,  966,  385,
+     821,   10,  445,  845,  579,  312,  759,  221,  697,  459,  900,  165,  426,  217,  126,  972,  788,  419,  897,   83,  517,  415,  691,  250,  979,  337,  828,   90,  539,   41,  242,  488,
+     322,  698,  196,  645,   38,  963,  422,   58, 1008,  318,  652,  542,  990,  706,  484,  371,   28,  740,  288,  674,  160,  801,  314,  113,  722,  425,  171,  612,  935,  726,  881,  629,
+    1017,  541,  931,  358,  499,  168,  852,  613,  528,  110,  235,  779,   39,  302,  913,  626,  164,  562,  475,  957,  375,  591,  940,  472,  557,  904,  789,  466,  269,  399,  188,  101,
+     424,  256,  130,  871,  753,  661,  252,  352,  766,  933,  395,  867,  598,   97,  798,  224, 1007,  862,   74,  228,  831,    1,  212,  756,   54,  279,  132,  702,   14,  832,  514,  777,
+      46,  816,  595,  287,  411,   87,  983,  477,    4,  684,  149,  474,  335,  695,  524,  438,  325,  644,  394,  725,  526,  658,  873,  344,  959,  663,  384, 1004,  560,  924,  300,  618,
+     953,  478,  712,   60,  898,  578,  812,  199,  891,  292,  570,  970,  203,  901,  117,  833,   17,  769,  142,  977,  321,  105,  417,  605,  146,  529,  849,  201,  340,   85,  678,  173,
+     865,  326,  209,  975,  510,  145,  327,  723,  608,  410,  805,   33,  745,  378,  617,  277,  947,  465,  594,  264,  859,  486, 1022,  251,  776,  443,   68,  604,  811,  462,  763,  389,
+     537,    8,  630,  771,  370,  680,  458,   61, 1023,  120,  232,  646,  505,  998,  174,  720,  536,  204,  908,   37,  672,  175,  731,   27,  895,  306,  951,  696,  240,  984,  118,  262,
+     732, 1010,  442,  111,  234,  938,  851,  282,  534,  868,  450,  929,  299,   76,  441,  870,   57,  382,  708,  434,  540,  817,  374,  572,  655,  185,  511,  376,   22,  556,  892,  650,
+      92,  351,  846,  561,  815,   25,  623,  190,  770,  356,  585,  156,  842,  688,  596,  328,  786, 1005,  304,  841,  116,  283,  936,   93,  429,  803,  131,  922,  738,  412,  167,  471,
+     928,  245,  151,  700,  290,  520,  427,  969,  102,  664,   44,  735,  402,  230,  958,  144,  566,   98,  610,  192,  974,  641,  498,  223,  705,  995,  586,  261,  834,  638,  313,  796,
+     516,  603,  885,  380,  996,   96,  714,  339,  495,  911,  284,  992,  538,   12,  762,  470,  265,  905,  491,  743,  363,    7,  778,  902,  319,   32,  353,  483,   70,  213,  986,   31,
+     368,  749,   63,  453,  643,  179,  889,  761,  225,  807,  420,  182,  823,  349,  914,  653,  386,  694,   55,  253,  875,  564,  414,  153,  554,  768,  872,  689,  912,  565,  440,  679,
+     169,  285,  943,  220,  787,  568,  311,    0,  577,  123,  636,  501,  682,  137,  580,   73,  184,  774,  978,  436,  647,   95, 1012,  266,  651,  448,  191,  124,  388,  775,  104,  863,
+     576,  836,  668,  503,   45,  960,  416,  676, 1011,  359,  930,   52,  869,  308,  457, 1018,  829,  330,  545,  138,  810,  324,  707,  847,   51,  965,  296,  611, 1006,  258,  329,  954,
+      13,  418,  127,  354,  825,  255,  525,  152,  835,  473,  267,  764,  195,  945,  728,  227,  428,   20,  622,  229,  939,  467,  176,  523,  366,  795,  502,  744,   42,  552,  724,  476,
+     241,  782, 1019,  607,  709,   91,  874,  729,  222,   75,  657,  546,  408,  616,   84,  527,  686,  923,  853,  383,  746,   29,  601,  950,  236,   94,  926,  407,  214,  820,  143,  637
+};
+
+float gradientDitherOffset (uint2 p)
+{
+    const uint2 cell = p & 31u;
+    const float u = (float (gradientDither[cell.y * 32 + cell.x]) + 0.5) / 1024.0;
+    return u < 0.5 ? sqrt (2.0 * u) - 1.0 : 1.0 - sqrt (2.0 - 2.0 * u);
+}
+
 // Colour stops of a gradient at t (pad): pairs (position, 0, 0, 0), colour (not premultiplied).
-// Interpolated per pixel, then premultiplied, as CoreGraphics draws a CGGradient.
-float4 stopColour (const device float4* stops, uint first, uint count, float t)
+// Interpolated per pixel, dithered at device pixel dp, then premultiplied, as CoreGraphics draws a
+// CGGradient.
+float4 stopColour (const device float4* stops, uint first, uint count, float t, float2 dp)
 {
     float4 c = stops[first + 1];
 
@@ -438,6 +499,10 @@ float4 stopColour (const device float4* stops, uint first, uint count, float t)
         }
     }
 
+    const uint2 p = uint2 (dp);
+    const float4 offset (gradientDitherOffset (p + uint2 (11, 23)), gradientDitherOffset (p),
+                         gradientDitherOffset (p + uint2 (23, 7)), 0.5 * gradientDitherOffset (p + uint2 (5, 17)));
+    c = saturate (c + offset / 255.0);
     return float4 (c.rgb * c.a, c.a);
 }
 
@@ -477,7 +542,7 @@ float4 gradientColour (const device GradientInfo* gradients, uint index, float2 
     else if (spread == 2)
         t = fract (max (t, 0.0));                                  // repeat
 
-    return stopColour (stops, uint (G.row0.w), uint (G.row1.w), t) * G.meta.w;
+    return stopColour (stops, uint (G.row0.w), uint (G.row1.w), t, p) * G.meta.w;
 }
 
 // Coverage of a winding number from the coverage atlas (area-weighted), by fill rule.
@@ -5604,9 +5669,9 @@ private:
 
         const auto spread = g.spreadMethod == ColourGradient::SpreadMethod::reflect ? 1.0f
                           : g.spreadMethod == ColourGradient::SpreadMethod::repeat  ? 2.0f : 0.0f;
-        // The colour stops, interpolated per pixel in the shader as CoreGraphics does (CGGradient:
-        // float components, not premultiplied), where the software renderer quantises them into
-        // a lookup table.
+        // The colour stops, interpolated and dithered per pixel in the shader as CoreGraphics does
+        // (CGGradient: float components, not premultiplied), where the software renderer quantises
+        // them into a lookup table.
         info.row0.w = (float) recorder.gradientStops.size();
         info.row1.w = (float) g.getNumColours();
 
