@@ -56,10 +56,11 @@
       as WebRender's opaque pass: the GPU rejects what they cover before shading it.
     - Rects, rounded rects, circles and lines: distance to the outline per pixel, turned into the
       exact area of the pixel inside it (halfPlaneCoverage), under any affine transform.
-    - Paths (fills, and strokes converted to fills by PathStrokeType) by coverage counting: their
-      flattened edges are accumulated as signed areas in an R32Float atlas on the GPU and a prefix
-      sum per row gives each pixel its winding number with exact area anti-aliasing (as
-      juce::EdgeTable). clipToPath reads the same coverage.
+    - Paths by coverage counting: their flattened edges are accumulated as signed areas in an
+      R32Float atlas on the GPU and a prefix sum per row gives each pixel its winding number with
+      exact area anti-aliasing (as juce::EdgeTable). clipToPath reads the same coverage. A
+      stroke's outline (offset edges, joins, caps) is built from its centre line on the GPU, by
+      the vertex shader of its accumulation (strokeAccumVs).
     - Glyphs: rasterised once by JUCE's CoreGraphics context into an R8 atlas, and found
       through one table per font size.
     - Gradients (colour stops interpolated per pixel), tiled-image fills, image clips, the image
@@ -71,7 +72,8 @@
     exact area elsewhere.
     - Text matches CoreGraphics to the pixel: same rasteriser, and glyphs placed as CoreGraphics
       places them in a window (x rounded down to 1/16 px, baseline rounded up to a whole pixel).
-    - Gradients interpolate their stops as CGGradient does (float components, not premultiplied).
+    - Gradients interpolate their stops as CGGradient does (float components, not premultiplied),
+      and are dithered the way it dithers them (see gradientDither).
     - Straight edges at any angle match CoreGraphics (both are the exact area).
     - Curves and rotated boxes: CoreGraphics strays from the exact area by ~12/255 RMS on their
       edges (its flattening, measured), JUCE's software renderer by a few levels (0.55 cubics);
@@ -124,6 +126,9 @@ constexpr const char* shaderSource = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
+// Tested and not kept: computing in half precision (twice the ALU rate of float on Apple GPUs)
+// saved 2.5% of the GPU time on a widget grid and took edges further from CoreGraphics.
+
 // xf0.w: the instance's painter's order (its index when recorded), which sets its depth: draws are
 // reordered before encoding (see FrameRecorder::reorder), so the buffer position isn't that order.
 struct Inst { float4 xf0; float4 xf1; float4 rect; float4 clip; float4 colour; float4 params; float4 uv; };
@@ -144,6 +149,8 @@ bool isAxisAligned (float4 inv) { return inv.y == 0.0 && inv.z == 0.0; }
 // edge, n being the edge's unit normal in device pixels: the box-filtered coverage that JUCE's
 // EdgeTable and CoreGraphics compute. A ramp of the distance alone, saturate (0.5 + t), is only
 // that area for horizontal and vertical edges; at 45 degrees it's off by up to 0.04 (11/255).
+// Using that ramp saved only 7% of the GPU time of a full repaint (2.57 to 2.39 ms on an M1): the
+// per-pixel cost is in the distance and its Jacobian, not in this area.
 // Piecewise: linear while the edge crosses two opposite sides of the square, quadratic while it
 // cuts a corner (a, b: the normal's larger and smaller components).
 float halfPlaneCoverage (float t, float2 n)
@@ -359,6 +366,7 @@ vertex OpaqueOut vsOpaque (uint vid [[vertex_id]], uint iid [[instance_id]],
 }
 
 fragment float4 fsOpaque (OpaqueOut in [[stage_in]]) { return in.colour; }
+fragment float4 fsOpaqueAlpha (OpaqueOut in [[stage_in]]) { return float4 (in.colour.a); } // R8 targets
 
 // Linear / radial gradients: t from the device pixel position (row0, row1: an affine map), the
 // colour from the gradient's stops in the stop buffer (row0.w: first stop, row1.w: stop count),
@@ -409,9 +417,69 @@ float twoPointConicalWeight (float2 q, float4 conic, thread bool& valid)
     return swapped ? 1.0 - t : t;
 }
 
+// Gradients are dithered as CoreGraphics dithers a CGGradient, so that a long low-contrast ramp
+// doesn't show its 1/255 steps as bands, nor a fade to transparent its alpha steps. Measured on
+// CoreGraphics (macOS 13, captures of opaque and translucent ramps over a neutral background):
+// - ordered 32 x 32 blue-noise matrices anchored to device pixels, the same on every draw;
+// - offsets with a triangular distribution (TPDF) over +-1/255 (standard deviation 0.41/255);
+// - added to the colour before it is premultiplied, so the noise in the result scales with alpha;
+// - an independent matrix per channel: red, green and blue are uncorrelated;
+// - translucent ramps carry more noise than the colour's alone, which an independent alpha
+//   offset of half the amplitude reproduces (fitted: the noise of five ramps within 0.06/255).
+// Skia, Chrome and WebRender dither too, but with one 8 x 8 Bayer matrix of uniform offsets within
+// +-0.5/255, added to the premultiplied colour and not to the alpha: this renderer follows
+// CoreGraphics, whose interpolation it already matches.
+// The matrix is not CoreGraphics' own: it is a void-and-cluster one (Ulichney 1993, Gaussian
+// sigma 1.5 on a 32 x 32 torus), read at a different offset for each channel (measured
+// correlation between them: at most 0.06). Its ranks are mapped through the triangular
+// distribution's inverse CDF, which keeps the blue-noise order.
+constant ushort gradientDither[1024] =
+{
+     896,  515,  189,  294,  915,  454,  342,  597,  396,  785,  976,  323,   11,  848,  275,  802,  139,  297,  494,   88,  654,  293,  826,  398,  719,  634,  170,  690,  877,  451,  980,  360,
+      99,  737,  401,   40,  558,  159,  994,   36,  916,  497,  112,  879,  717,  464,  968,  377,  575,  991,  193,  794,  551, 1002,  158,   62,  893,  549,  343,    2,  590,  270,   59,  666,
+     286,  592,  934,  843,  670,  791,  231,  687,  307,  181,  632,  246,  559,  133,  207,  659,   77,  713,  432,  886,  239,  350,  509,  765,  444,  276, 1016,  757,  381,  918,  521,  799,
+    1000,  172,  480,  114,  336,  506,  413,  856,  531,  754,  433, 1015,  379,  773,  906,  490,  838,  341,   16,  619,  115,  701,  910,  625,  197,  109,  840,  496,  150,  703,  210,  435,
+      21,  365,  715,  243,  973,    9,  620,  129,  942,   81,  822,   30,  685,  303,   56,  606,  259,  948,  751,  479,  971,  404,   34,  310,  962,  571,  667,  247,  955,   80,  602,  860,
+     548,  920,  627,  800,  555,  880,  206,  711,  273,  361,  581,  219,  858,  460,  989,  392,  135,  535,  205,  298,  781,  178,  850,  489,  797,  393,   26,  332,  819,  406,  760,  316,
+     730,  136,  421,   64,  295,  748,  373,  999,  468,  660,  925,  507,  119,  635,  186,  727,  887,  640,  830,   82,  600,  522,  671,  244,   86,  716,  937,  615,  481,  162,  987,  237,
+     485,  839,  208,  985,  461,  147,  518,  813,   48,  163,  750,  289,  961,  348,  808,  500,   43,  334,  439, 1021,  369,  883,  122,  988,  347,  512,  180,  855,   72,  673,  574,   49,
+     952,  681,  346,  593,  894,  675,   79,  587,  257,  876,  409,    3,  677,  569,  100,  272,  967,  692,  161,  721,    6,  271,  446,  747,  584,  888,  274,  431,  742,  305,  884,  390,
+     280,  550,   15,  780,  248,  400,  857,  338,  949,  633,  533,  793,  226,  907,  437,  837,  543,  218,  921,  487,  806,  649,  917,  211,   35,  792,  125, 1014,  532,  200,  772,  128,
+     809,  177,  927,  492,  103, 1020,  202,  758,  455,  106,  315, 1009,  134,  372,  752,   23,  624,  397,   71,  588,  333,  154,  547,  405,  693,  463,  639,  364,    5,  941,  456,  628,
+    1003,  423,  734,  320,  621,  718,  544,   24,  662,  183,  854,  469,  699,  589,  194,  997,  309,  878,  784,  233,  964,  844,   67,  993,  291,  932,  238,  814,  582,  704,  345,   53,
+     216,  656,   65,  882,  166,  447,  281,  827,  981,  403,  733,   89,  268,  919,  449,  683,  157,  493,  710,  107,  452,  631,  357,  767,  141,  563,   69,  903,  155,  263,  864,  513,
+     899,  301,  553,  391,  790,  946,   78,  367,  567,  254,  609,  956,  519,   50,  331,  824,   66,  944,  362,  573,  278,  739,  198,  482,  866,  387,  736,  504,  430,  783,  108,  599,
+     148,  741,  982,  249,  121,  669,  508,  890,  140,  804,   18,  355,  755,  861,  642,  530,  260,  614,  187,  818, 1013,   47,  909,  583,   19,  648,  215, 1001,  317,  665,  966,  385,
+     821,   10,  445,  845,  579,  312,  759,  221,  697,  459,  900,  165,  426,  217,  126,  972,  788,  419,  897,   83,  517,  415,  691,  250,  979,  337,  828,   90,  539,   41,  242,  488,
+     322,  698,  196,  645,   38,  963,  422,   58, 1008,  318,  652,  542,  990,  706,  484,  371,   28,  740,  288,  674,  160,  801,  314,  113,  722,  425,  171,  612,  935,  726,  881,  629,
+    1017,  541,  931,  358,  499,  168,  852,  613,  528,  110,  235,  779,   39,  302,  913,  626,  164,  562,  475,  957,  375,  591,  940,  472,  557,  904,  789,  466,  269,  399,  188,  101,
+     424,  256,  130,  871,  753,  661,  252,  352,  766,  933,  395,  867,  598,   97,  798,  224, 1007,  862,   74,  228,  831,    1,  212,  756,   54,  279,  132,  702,   14,  832,  514,  777,
+      46,  816,  595,  287,  411,   87,  983,  477,    4,  684,  149,  474,  335,  695,  524,  438,  325,  644,  394,  725,  526,  658,  873,  344,  959,  663,  384, 1004,  560,  924,  300,  618,
+     953,  478,  712,   60,  898,  578,  812,  199,  891,  292,  570,  970,  203,  901,  117,  833,   17,  769,  142,  977,  321,  105,  417,  605,  146,  529,  849,  201,  340,   85,  678,  173,
+     865,  326,  209,  975,  510,  145,  327,  723,  608,  410,  805,   33,  745,  378,  617,  277,  947,  465,  594,  264,  859,  486, 1022,  251,  776,  443,   68,  604,  811,  462,  763,  389,
+     537,    8,  630,  771,  370,  680,  458,   61, 1023,  120,  232,  646,  505,  998,  174,  720,  536,  204,  908,   37,  672,  175,  731,   27,  895,  306,  951,  696,  240,  984,  118,  262,
+     732, 1010,  442,  111,  234,  938,  851,  282,  534,  868,  450,  929,  299,   76,  441,  870,   57,  382,  708,  434,  540,  817,  374,  572,  655,  185,  511,  376,   22,  556,  892,  650,
+      92,  351,  846,  561,  815,   25,  623,  190,  770,  356,  585,  156,  842,  688,  596,  328,  786, 1005,  304,  841,  116,  283,  936,   93,  429,  803,  131,  922,  738,  412,  167,  471,
+     928,  245,  151,  700,  290,  520,  427,  969,  102,  664,   44,  735,  402,  230,  958,  144,  566,   98,  610,  192,  974,  641,  498,  223,  705,  995,  586,  261,  834,  638,  313,  796,
+     516,  603,  885,  380,  996,   96,  714,  339,  495,  911,  284,  992,  538,   12,  762,  470,  265,  905,  491,  743,  363,    7,  778,  902,  319,   32,  353,  483,   70,  213,  986,   31,
+     368,  749,   63,  453,  643,  179,  889,  761,  225,  807,  420,  182,  823,  349,  914,  653,  386,  694,   55,  253,  875,  564,  414,  153,  554,  768,  872,  689,  912,  565,  440,  679,
+     169,  285,  943,  220,  787,  568,  311,    0,  577,  123,  636,  501,  682,  137,  580,   73,  184,  774,  978,  436,  647,   95, 1012,  266,  651,  448,  191,  124,  388,  775,  104,  863,
+     576,  836,  668,  503,   45,  960,  416,  676, 1011,  359,  930,   52,  869,  308,  457, 1018,  829,  330,  545,  138,  810,  324,  707,  847,   51,  965,  296,  611, 1006,  258,  329,  954,
+      13,  418,  127,  354,  825,  255,  525,  152,  835,  473,  267,  764,  195,  945,  728,  227,  428,   20,  622,  229,  939,  467,  176,  523,  366,  795,  502,  744,   42,  552,  724,  476,
+     241,  782, 1019,  607,  709,   91,  874,  729,  222,   75,  657,  546,  408,  616,   84,  527,  686,  923,  853,  383,  746,   29,  601,  950,  236,   94,  926,  407,  214,  820,  143,  637
+};
+
+float gradientDitherOffset (uint2 p)
+{
+    const uint2 cell = p & 31u;
+    const float u = (float (gradientDither[cell.y * 32 + cell.x]) + 0.5) / 1024.0;
+    return u < 0.5 ? sqrt (2.0 * u) - 1.0 : 1.0 - sqrt (2.0 - 2.0 * u);
+}
+
 // Colour stops of a gradient at t (pad): pairs (position, 0, 0, 0), colour (not premultiplied).
-// Interpolated per pixel, then premultiplied, as CoreGraphics draws a CGGradient.
-float4 stopColour (const device float4* stops, uint first, uint count, float t)
+// Interpolated per pixel, dithered at device pixel dp, then premultiplied, as CoreGraphics draws a
+// CGGradient.
+float4 stopColour (const device float4* stops, uint first, uint count, float t, float2 dp)
 {
     float4 c = stops[first + 1];
 
@@ -431,6 +499,10 @@ float4 stopColour (const device float4* stops, uint first, uint count, float t)
         }
     }
 
+    const uint2 p = uint2 (dp);
+    const float4 offset (gradientDitherOffset (p + uint2 (11, 23)), gradientDitherOffset (p),
+                         gradientDitherOffset (p + uint2 (23, 7)), 0.5 * gradientDitherOffset (p + uint2 (5, 17)));
+    c = saturate (c + offset / 255.0);
     return float4 (c.rgb * c.a, c.a);
 }
 
@@ -470,7 +542,7 @@ float4 gradientColour (const device GradientInfo* gradients, uint index, float2 
     else if (spread == 2)
         t = fract (max (t, 0.0));                                  // repeat
 
-    return stopColour (stops, uint (G.row0.w), uint (G.row1.w), t) * G.meta.w;
+    return stopColour (stops, uint (G.row0.w), uint (G.row1.w), t, p) * G.meta.w;
 }
 
 // Coverage of a winding number from the coverage atlas (area-weighted), by fill rule.
@@ -508,6 +580,12 @@ float maskAt (texture2d<float> mask, MaskInfo info, float2 p)
 // 0: boxes and ellipses (kinds 0, 1), 1: glyphs (2), 2: images (3, 4), 3: path coverage (5).
 constant uint family [[function_constant(0)]];
 
+// Single-channel images are drawn into R8 targets (MetalPixelData): their pipelines write the
+// alpha into the red channel, which their blending then treats as the destination's alpha.
+constant bool alphaTarget [[function_constant(1)]];
+
+static inline float4 toTarget (float4 premultiplied) { return alphaTarget ? float4 (premultiplied.a) : premultiplied; }
+
 // The main pass only tests depth (opaque pass), so testing it before shading changes nothing but
 // guarantees that hidden pixels aren't shaded, also on GPUs that would otherwise test after a
 // shader that can discard.
@@ -535,7 +613,7 @@ fragment float4 fs (VOut in [[stage_in]], const device Inst* inst [[buffer(0)]],
     if (family == 1)
     {
         constexpr sampler nearest (filter::nearest, coord::normalized);
-        return I.colour * (glyphs.sample (nearest, in.uv).r * m);
+        return toTarget (I.colour * (glyphs.sample (nearest, in.uv).r * m));
     }
 
     if (family == 2)
@@ -545,7 +623,7 @@ fragment float4 fs (VOut in [[stage_in]], const device Inst* inst [[buffer(0)]],
         const float2 halfSize = 0.5 * I.rect.zw;
         const float edges = isAxisAligned (in.inv) ? 1.0 : boxCoverage (in.local - (I.rect.xy + halfSize), halfSize, in.inv, in.axisRates);
         const float4 texel = image.sample (imageSampler, in.uv);
-        return kind == 3 ? texel * (I.colour.a * m * edges) : I.colour * (texel.r * m * edges);
+        return toTarget (kind == 3 ? texel * (I.colour.a * m * edges) : I.colour * (texel.r * m * edges));
     }
 
     if (family == 3)
@@ -559,7 +637,7 @@ fragment float4 fs (VOut in [[stage_in]], const device Inst* inst [[buffer(0)]],
 
         const float4 fill = I.params.w > 0.5 ? gradientColour (gradients, uint (I.params.w) - 1, dp, gradientStops, image, imageSampler)
                                              : I.colour;
-        return fill * (c * m);
+        return toTarget (fill * (c * m));
     }
 
     const float2 halfSize = 0.5 * I.rect.zw;
@@ -626,7 +704,7 @@ fragment float4 fs (VOut in [[stage_in]], const device Inst* inst [[buffer(0)]],
 
     const float4 colour = I.params.w > 0.5 ? gradientColour (gradients, uint (I.params.w) - 1, dp, gradientStops, image, imageSampler)
                                            : I.colour;
-    return colour * (shapeCoverage * m);
+    return toTarget (colour * (shapeCoverage * m));
 }
 
 // ---- Mask passes: render into an R8 mask covering 'origin' + target size, multiplied by the
@@ -724,6 +802,27 @@ float coveredFraction (float right, float xa, float xb)
                             : (0.5 * (b * b - a * a) + (max (hi, 1.0) - max (lo, 1.0))) / (hi - lo);
 }
 
+// A segment's delta in a cell of its path's rectangle, whose left side is at x = left.
+float edgeDelta (float4 line, float2 cell, float left)
+{
+    // The part of the segment within this pixel row (signed: the edge direction gives the winding).
+    const float ya = clamp (line.y, cell.y, cell.y + 1.0);
+    const float yb = clamp (line.w, cell.y, cell.y + 1.0);
+    const float dy = yb - ya;
+
+    if (dy == 0.0)
+        return 0.0;
+
+    const float dxdy = (line.z - line.x) / (line.w - line.y);
+    const float xa = line.x + (ya - line.y) * dxdy;
+    const float xb = line.x + (yb - line.y) * dxdy;
+
+    // Delta from the previous cell; the rectangle's first column holds the full value.
+    const float here = coveredFraction (cell.x + 1.0, xa, xb);
+    const float before = cell.x > left ? coveredFraction (cell.x, xa, xb) : 0.0;
+    return dy * (here - before);
+}
+
 fragment float4 accumFs (AccOut in [[stage_in]], const device Seg* segs [[buffer(0)]])
 {
     const Seg s = segs[in.sid];
@@ -733,22 +832,390 @@ fragment float4 accumFs (AccOut in [[stage_in]], const device Seg* segs [[buffer
     if (cell.x < s.rect.x || cell.x >= s.rect.z)
         discard_fragment();
 
-    // The part of the segment within this pixel row (signed: the edge direction gives the winding).
-    const float ya = clamp (s.line.y, cell.y, cell.y + 1.0);
-    const float yb = clamp (s.line.w, cell.y, cell.y + 1.0);
-    const float dy = yb - ya;
+    const float d = edgeDelta (s.line, cell, s.rect.x);
 
-    if (dy == 0.0)
+    if (d == 0.0)
         discard_fragment();
 
-    const float dxdy = (s.line.z - s.line.x) / (s.line.w - s.line.y);
-    const float xa = s.line.x + (ya - s.line.y) * dxdy;
-    const float xb = s.line.x + (yb - s.line.y) * dxdy;
+    return float4 (d, 0.0, 0.0, 0.0);
+}
 
-    // Delta from the previous cell; the rectangle's first column holds the full value.
-    const float here = coveredFraction (cell.x + 1.0, xa, xb);
-    const float before = cell.x > s.rect.x ? coveredFraction (cell.x, xa, xb) : 0.0;
-    return float4 (dy * (here - before), 0.0, 0.0, 0.0);
+// ---- Strokes: their outline is built on the GPU from the centre line, each segment on its own
+// (Levien & Uguray, "GPU-friendly Stroke Expansion", 2024). The outline of a stroke is a
+// closed loop of edges (the left offsets forwards, the end cap, the right offsets backwards, the
+// start cap) and coverage counting only needs its edges, in any order. So each point of the centre
+// line owns the edges around it: the two offset edges of the segment starting there and its join
+// with the next (the outer side beveled, mitered or rounded; the inner side a bevel, whose overlap
+// the non-zero rule absorbs, as in that paper); an open sub-path's first point also owns the
+// start cap, its last point the end cap. They are built in the stroke's space (where its width
+// is), then transformed to the atlas. A quad covers up to eight of a point's edges (usually all of
+// them) and sums their deltas in each cell: a quad per edge would be about twice as many as the
+// CPU-built outline has, and the vertex stage of this pass is already as costly as its fragments.
+// The CPU lists the quads (StrokeQuad): a point has as many as its edges need (round joins: as
+// many arc steps as their turn takes).
+// Tested and not kept, measured on an M1 (Metal System Trace) against the CPU-built outline:
+// - A compute pass writing the edges into a buffer that accumVs then draws: about 0.4 ms more per
+//   frame whatever the stroke (the accumulation waits for it).
+// - One instance per edge, in a fixed number of slots per point: about five quads per point, twice
+//   the CPU outline's, and the vertex stage costs per quad, empty or not (4 ms per frame for 50k
+//   points against 1.9). Larger varyings per vertex overflowed the tiler's parameter buffer.
+// - A quad's fragments summing all eight edge slots rather than those in use: +50% at 1 px.
+// - Each edge recomputing its point's joints, rather than once per vertex: +28% vertex time.
+// - Before this, the CPU outline written straight into segments (no Path, no second flattening):
+//   only 15-20% less encoding, the joints' maths dominating. ----
+struct StrokeJob
+{
+    float4 xf0, xf1;    // stroke space -> atlas px: x' = dot (xf0.xy, p) + xf0.z, y' = dot (xf1.xy, p) + xf1.z
+    float4 rect;        // the path's atlas rectangle
+    float4 style;       // half width, miter limit squared, arc step (radians), unused
+    uint4 layout;       // joint (PathStrokeType::JointStyle), cap (EndCapStyle), edges per cap, arc steps per half turn
+};
+struct StrokeSub { uint first, count, closed, job; };
+struct StrokePoint { float2 p; };
+struct StrokeQuad { uint point, subAndEdge; }; // the point (index in the points), its sub-path << 8 | its first edge
+
+constant uint strokeEdgesPerQuad = 8;
+
+float2 rotated (float2 v, float angle)
+{
+    const float c = cos (angle), s = sin (angle);
+    return float2 (v.x * c - v.y * s, v.x * s + v.y * c);
+}
+
+// Edge m of the arc from c + v0 to c + v1, turning by 'angle' in steps of at most 'step'.
+bool arcEdge (float2 c, float2 v0, float2 v1, float angle, float step, uint maxSteps, uint m, thread float2& a, thread float2& b)
+{
+    const uint n = clamp (uint (ceil (abs (angle) / step)), 1u, maxSteps);
+
+    if (m >= n)
+        return false;
+
+    a = c + (m == 0 ? v0 : rotated (v0, angle * float (m) / float (n)));
+    b = c + (m + 1 == n ? v1 : rotated (v0, angle * float (m + 1) / float (n)));
+    return true;
+}
+
+// A joint of the centre line: at p, from the segment along t0 (length len0; offset n0: t0 turned a
+// quarter turn, times the half width) to the one along t1. The outer side is the right (-n) when
+// turning towards +n (cr > 0). On the inner side, the two offset lines cross at
+// p +- (n0 + n1) / (1 + d), which lies on both offset edges when half the width times
+// tan (half the turn) is at most both lengths: they then end there, as in PathStrokeType's outline
+// (its lineIntersection). Otherwise an inner bevel joins them, and the overlap it leaves is
+// absorbed by the non-zero rule, as in that paper and in PathStrokeType for short segments.
+// Built by one function wherever it is needed, so that the two segments meeting there agree.
+struct Joint
+{
+    float2 p, t0, t1, n0, n1;
+    float cr, d;
+    bool innerMeets;
+    float2 inner; // where the inner offset edges end when they meet
+};
+
+Joint strokeJoint (const device StrokePoint* points, StrokeSub sub, uint j, float hw)
+{
+    const uint n = sub.count;
+    const float2 before = points[sub.first + (j + n - 1) % n].p, p = points[sub.first + j % n].p;
+    const float2 after = points[sub.first + (j + 1) % n].p;
+    const float len0 = length (p - before), len1 = length (after - p);
+
+    Joint J;
+    J.p = p;
+    J.t0 = (p - before) / len0;
+    J.t1 = (after - p) / len1;
+    J.n0 = hw * float2 (-J.t0.y, J.t0.x);
+    J.n1 = hw * float2 (-J.t1.y, J.t1.x);
+    J.cr = J.t0.x * J.t1.y - J.t0.y * J.t1.x;
+    J.d = dot (J.t0, J.t1);
+    J.innerMeets = J.cr != 0.0 && 1.0 + J.d > 0.0 && hw * abs (J.cr) <= (1.0 + J.d) * min (len0, len1);
+    const float2 m = (J.n0 + J.n1) / (1.0 + J.d);
+    J.inner = J.cr > 0.0 ? p + m : p - m;
+    return J;
+}
+
+// Edge e of a joint's join: the loop goes p + n0 -> p + n1 on the left, p - n1 -> p - n0 on the
+// right. The outer side gets the miter point or the arc; the inner side a bevel unless its offset
+// edges meet.
+bool joinEdge (const device StrokeJob& job, Joint J, uint e, thread float2& a, thread float2& b)
+{
+    const float2 front0 = J.p + J.n0, front1 = J.p + J.n1, back0 = J.p - J.n1, back1 = J.p - J.n0;
+    const bool backIsOuter = J.cr > 0.0;
+    const float2 inner0 = backIsOuter ? front0 : back0, inner1 = backIsOuter ? front1 : back1;
+
+    // Mitered, within the limit (PathStrokeType: the miter point at most miterLimit half widths
+    // from p, i.e. 1 / cos (half the turn) <= miterLimit): the outer side through the miter point.
+    if (job.layout.x == 0 && J.cr != 0.0 && 2.0 <= (1.0 + J.d) * job.style.y)
+    {
+        const float2 m = (J.n0 + J.n1) / (1.0 + J.d);
+        const float2 outer0 = backIsOuter ? back0 : front0, outer1 = backIsOuter ? back1 : front1;
+        const float2 tip = backIsOuter ? J.p - m : J.p + m;
+
+        switch (e)
+        {
+            case 0:  a = outer0; b = tip; return true;
+            case 1:  a = tip; b = outer1; return true;
+            case 2:  a = inner0; b = inner1; return ! J.innerMeets;
+            default: return false;
+        }
+    }
+
+    // Curved: the inner bevel, then an arc on the outer side; a full reversal turns round the end,
+    // on the left.
+    if (job.layout.x == 1 && (J.cr != 0.0 || J.d < 0.0))
+    {
+        const float angle = J.cr == 0.0 ? -M_PI_F : atan2 (J.cr, J.d);
+
+        if (e == 0)
+        {
+            a = angle > 0.0 ? front0 : back0;
+            b = angle > 0.0 ? front1 : back1;
+            return ! J.innerMeets;
+        }
+
+        return angle > 0.0 ? arcEdge (J.p, -J.n1, -J.n0, -angle, job.style.z, job.layout.w, e - 1, a, b)
+                           : arcEdge (J.p, J.n0, J.n1, angle, job.style.z, job.layout.w, e - 1, a, b);
+    }
+
+    // Beveled (or straight on): both sides, the inner one unless its edges meet.
+    switch (e)
+    {
+        case 0:  a = front0; b = front1; return ! (J.innerMeets && backIsOuter);
+        case 1:  a = back0; b = back1; return ! (J.innerMeets && ! backIsOuter);
+        default: return false;
+    }
+}
+
+// Edge e of a cap at p, from p + v (v: the offset, a quarter turn from the outward direction
+// 'out') round to p - v.
+bool capEdge (const device StrokeJob& job, float2 p, float2 out, float2 v, uint e, thread float2& a, thread float2& b)
+{
+    if (job.layout.y == 2) // rounded: half a turn through p + out
+        return arcEdge (p, v, -v, -M_PI_F, job.style.z, job.layout.w, e, a, b);
+
+    if (job.layout.y == 1) // square
+    {
+        const float2 x = out * job.style.x;
+
+        switch (e)
+        {
+            case 0:  a = p + v; b = p + v + x; return true;
+            case 1:  a = p + v + x; b = p - v + x; return true;
+            case 2:  a = p - v + x; b = p - v; return true;
+            default: return false;
+        }
+    }
+
+    a = p + v;
+    b = p - v;
+    return e == 0;
+}
+
+// Point k's part of a sub-path's outline, in stroke space: (for an open sub-path's first point,
+// the start cap,) the two offset edges of the segment starting at it and its join with the next;
+// an open sub-path's last point has the end cap. Built once per vertex, then read edge by edge
+// (pointEdge).
+struct PointOutline
+{
+    bool capsOnly;                          // an open sub-path's last point
+    float2 p0, t0, n0;
+    float2 leftStart, leftEnd, rightStart, rightEnd;
+    bool hasJoin;
+    Joint join;
+};
+
+PointOutline pointOutline (const device StrokePoint* points, StrokeSub sub, const device StrokeJob& job, uint k)
+{
+    const uint n = sub.count;
+    const bool closed = sub.closed != 0;
+    const uint segments = closed ? n : n - 1;
+    const float hw = job.style.x;
+
+    PointOutline o;
+    o.capsOnly = k >= segments;
+    o.p0 = points[sub.first + k].p;
+
+    if (o.capsOnly)
+        return o;
+
+    const float2 p1 = points[sub.first + (k + 1) % n].p;
+    o.t0 = normalize (p1 - o.p0);
+    o.n0 = hw * float2 (-o.t0.y, o.t0.x);
+
+    // The offset edges, ending where they meet the neighbours' on an inner side.
+    o.leftStart = o.p0 + o.n0;
+    o.rightStart = o.p0 - o.n0;
+    o.leftEnd = p1 + o.n0;
+    o.rightEnd = p1 - o.n0;
+
+    if (k > 0 || closed)
+    {
+        const Joint J = strokeJoint (points, sub, k, hw);
+
+        if (J.innerMeets)
+            (J.cr > 0.0 ? o.leftStart : o.rightStart) = J.inner;
+    }
+
+    o.hasJoin = k + 1 < segments || closed;
+
+    if (o.hasJoin)
+    {
+        o.join = strokeJoint (points, sub, k + 1, hw);
+
+        if (o.join.innerMeets)
+            (o.join.cr > 0.0 ? o.leftEnd : o.rightEnd) = o.join.inner;
+    }
+
+    return o;
+}
+
+bool pointEdge (thread const PointOutline& o, const device StrokePoint* points, StrokeSub sub, const device StrokeJob& job,
+                uint k, uint e, thread float2& a, thread float2& b)
+{
+    const float hw = job.style.x;
+    const uint capEdges = job.layout.z;
+
+    if (o.capsOnly)
+    {
+        const float2 t = normalize (o.p0 - points[sub.first + k - 1].p);
+        return capEdge (job, o.p0, t, hw * float2 (-t.y, t.x), e, a, b);
+    }
+
+    if (k == 0 && sub.closed == 0)
+    {
+        if (e < capEdges)
+            return capEdge (job, o.p0, -o.t0, -o.n0, e, a, b);
+
+        e -= capEdges;
+    }
+
+    switch (e)
+    {
+        case 0:  a = o.leftStart; b = o.leftEnd; return true;
+        case 1:  a = o.rightEnd; b = o.rightStart; return true;
+        default: return o.hasJoin && joinEdge (job, o.join, e - 2, a, b);
+    }
+}
+
+struct StrokeOut
+{
+    float4 pos [[position]];
+    float4 rect [[flat]];
+    uint count [[flat]]; // the edges in use, packed from e0
+    float4 e0 [[flat]], e1 [[flat]], e2 [[flat]], e3 [[flat]], e4 [[flat]], e5 [[flat]], e6 [[flat]], e7 [[flat]];
+};
+
+vertex StrokeOut strokeAccumVs (uint vid [[vertex_id]], uint iid [[instance_id]],
+                                const device StrokePoint* points [[buffer(0)]], constant float2& atlasSize [[buffer(1)]],
+                                constant uint& firstQuad [[buffer(2)]], const device StrokeSub* subs [[buffer(3)]],
+                                const device StrokeJob* jobs [[buffer(4)]], const device StrokeQuad* quads [[buffer(5)]])
+{
+    const StrokeQuad quad = quads[firstQuad + iid];
+    const StrokeSub sub = subs[quad.subAndEdge >> 8];
+    const device StrokeJob& job = jobs[sub.job];
+    const uint k = quad.point - sub.first, firstOfPoint = quad.subAndEdge & 255;
+
+    float4 edges[strokeEdgesPerQuad];
+    float2 lowest = float2 (FLT_MAX), highest = float2 (-FLT_MAX); // (fast math: no infinities)
+    uint count = 0;
+    const float2 s0 = points[sub.first + k].p, s1 = points[sub.first + (k + 1) % sub.count].p;
+    const float2 c0 = float2 (dot (job.xf0.xy, s0) + job.xf0.z, dot (job.xf1.xy, s0) + job.xf1.z);
+    const float2 c1 = float2 (dot (job.xf0.xy, s1) + job.xf0.z, dot (job.xf1.xy, s1) + job.xf1.z);
+    const float dxdy = c0.y != c1.y ? (c1.x - c0.x) / (c1.y - c0.y) : 0.0;
+    float margin = 0.0; // the furthest an edge gets from the segment's line, along x
+
+    const PointOutline outline = pointOutline (points, sub, job, k);
+
+    for (uint i = 0; i < strokeEdgesPerQuad; ++i)
+        edges[i] = float4 (0.0);
+
+    for (uint i = 0; i < strokeEdgesPerQuad; ++i)
+    {
+        float2 a, b;
+
+        if (pointEdge (outline, points, sub, job, k, firstOfPoint + i, a, b))
+        {
+            a = float2 (dot (job.xf0.xy, a) + job.xf0.z, dot (job.xf1.xy, a) + job.xf1.z);
+            b = float2 (dot (job.xf0.xy, b) + job.xf0.z, dot (job.xf1.xy, b) + job.xf1.z);
+
+            // Horizontal edges add no area.
+            if (a.y != b.y)
+            {
+                edges[count++] = float4 (a, b);
+                lowest = min (lowest, min (a, b));
+                highest = max (highest, max (a, b));
+                margin = max (margin, max (abs (a.x - c0.x - (a.y - c0.y) * dxdy), abs (b.x - c0.x - (b.y - c0.y) * dxdy)));
+            }
+        }
+    }
+
+    StrokeOut o;
+    o.rect = job.rect;
+    o.count = count;
+    o.e0 = edges[0]; o.e1 = edges[1]; o.e2 = edges[2]; o.e3 = edges[3];
+    o.e4 = edges[4]; o.e5 = edges[5]; o.e6 = edges[6]; o.e7 = edges[7];
+
+    if (count == 0)
+    {
+        o.pos = float4 (-2.0, -2.0, 0.0, 1.0);
+        return o;
+    }
+
+    // The cells the edges change, as accumVs: their rows, from the cell under their leftmost point
+    // to the one after their rightmost, within the rectangle. An edge reaching left of the
+    // rectangle (the area cuts the stroke there) adds what lies left of it in its first column,
+    // which the box then starts from.
+    const float4 r = job.rect;
+    const bool crossesLeft = lowest.x < r.x;
+    const float y0 = max (floor (lowest.y), r.y);
+    const float y1 = max (y0, min (ceil (highest.y), r.w));
+    const float x0 = clamp (floor (lowest.x), r.x, r.z - 1.0);
+    const float x1 = clamp (floor (highest.x) + 2.0, x0 + 1.0, r.z);
+    const float2 corner = float2 (vid & 1, vid >> 1);
+    float2 p = mix (float2 (x0, y0), float2 (x1, y1), corner);
+
+    // Or a band along the point's segment, when narrower: an edge's distance along x from the
+    // segment's line is linear along it, so at most 'margin' (from its ends), and the line moves by
+    // up to 0.5 |dx/dy| across a row (see accumVs). An open sub-path's last point (its end cap)
+    // keeps the box.
+    const uint segments = sub.closed != 0 ? sub.count : sub.count - 1;
+
+    if (! crossesLeft && k < segments && c0.y != c1.y)
+    {
+        const float halfWidth = 0.5 * abs (dxdy) + margin;
+
+        if (2.0 * halfWidth + 3.0 < x1 - x0)
+        {
+            const float x = c0.x + (p.y - c0.y) * dxdy;
+            p.x = corner.x == 0.0 ? x - halfWidth - 1.0 : x + halfWidth + 2.0;
+        }
+    }
+
+    o.pos = float4 (p / atlasSize * float2 (2.0, -2.0) + float2 (-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+
+fragment float4 strokeAccumFs (StrokeOut in [[stage_in]])
+{
+    const float2 cell = floor (in.pos.xy);
+
+    if (cell.x < in.rect.x || cell.x >= in.rect.z)
+        discard_fragment();
+
+    // Only the edges in use (the same count over the quad, so these branches don't diverge).
+    const float left = in.rect.x;
+    float d = edgeDelta (in.e0, cell, left);
+
+    if (in.count > 1) d += edgeDelta (in.e1, cell, left);
+    if (in.count > 2) d += edgeDelta (in.e2, cell, left);
+    if (in.count > 3) d += edgeDelta (in.e3, cell, left);
+    if (in.count > 4) d += edgeDelta (in.e4, cell, left);
+    if (in.count > 5) d += edgeDelta (in.e5, cell, left);
+    if (in.count > 6) d += edgeDelta (in.e6, cell, left);
+    if (in.count > 7) d += edgeDelta (in.e7, cell, left);
+
+    if (d == 0.0)
+        discard_fragment();
+
+    return float4 (d, 0.0, 0.0, 0.0);
 }
 
 // One SIMD group per row of a path's rectangle: running sum of the deltas along the row, a SIMD
@@ -808,6 +1275,100 @@ fragment float4 fsClear (VOut in [[stage_in]], const device Inst* inst [[buffer(
         discard_fragment();
 
     return float4 (0.0);
+}
+
+// ---- Single-channel box blur (SceneEncoder::encodeBlur): the software renderer's algorithm
+// (blurSingleChannelImage in juce_Image.cpp), exactly: 'passes' 3-tap averages along a line,
+// (a + b + c + 1) / 3 in integers, the pixels outside the line counting as 0. One threadgroup
+// per line (a row, then a column), the line kept in threadgroup memory across its passes. ----
+struct BlurParams { uint2 srcOrigin; uint2 dstOrigin; uint length; uint vertical; uint passes; uint lines; };
+
+static uint2 linePixel (uint2 origin, uint vertical, uint line, uint i)
+{
+    return origin + (vertical != 0 ? uint2 (line, i) : uint2 (i, line));
+}
+
+// The line's threadgroup memory is sized to it (a fixed 16 KB would leave room for few
+// threadgroups at once): up to 256 threads (SharedResources::blurThreads), 64 pixels each.
+kernel void boxBlurLines (texture2d<float, access::read> src [[texture(0)]],
+                          texture2d<float, access::write> dst [[texture(1)]],
+                          constant BlurParams& p [[buffer(0)]],
+                          threadgroup uchar* values [[threadgroup(0)]],
+                          uint line [[threadgroup_position_in_grid]],
+                          uint tid [[thread_position_in_threadgroup]],
+                          uint threads [[threads_per_threadgroup]])
+{
+    const uint n = p.length;
+
+    for (uint i = tid; i < n; i += threads)
+        values[i] = uchar (src.read (linePixel (p.srcOrigin, p.vertical, line, i)).r * 255.0 + 0.5);
+
+    threadgroup_barrier (mem_flags::mem_threadgroup);
+
+    for (uint pass = 0; pass < p.passes; ++pass)
+    {
+        uchar next[64];
+
+        for (uint i = tid, k = 0; i < n; i += threads, ++k)
+        {
+            const uint left = i > 0 ? uint (values[i - 1]) : 0u;
+            const uint right = i + 1 < n ? uint (values[i + 1]) : 0u;
+            next[k] = uchar ((left + uint (values[i]) + right + 1) / 3);
+        }
+
+        threadgroup_barrier (mem_flags::mem_threadgroup);
+
+        for (uint i = tid, k = 0; i < n; i += threads, ++k)
+            values[i] = next[k];
+
+        threadgroup_barrier (mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = tid; i < n; i += threads)
+        dst.write (float4 (float (values[i]) / 255.0), linePixel (p.dstOrigin, p.vertical, line, i));
+}
+
+// The same for lines of up to 16 pixels per SIMD lane (512 on Apple GPUs): one SIMD group per
+// line, each lane holding 16 consecutive pixels in registers and exchanging its end pixels with
+// its neighbours by shuffles, so no pass waits on a threadgroup barrier.
+kernel void boxBlurLinesSimd (texture2d<float, access::read> src [[texture(0)]],
+                              texture2d<float, access::write> dst [[texture(1)]],
+                              constant BlurParams& p [[buffer(0)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint simdIndex [[simdgroup_index_in_threadgroup]],
+                              uint simdsPerGroup [[simdgroups_per_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint simdWidth [[threads_per_simdgroup]])
+{
+    const uint line = group * simdsPerGroup + simdIndex;
+
+    if (line >= p.lines) // the whole SIMD group: one line each
+        return;
+
+    const uint n = p.length, first = lane * 16;
+    uint v[16];
+
+    for (uint j = 0; j < 16; ++j)
+        v[j] = first + j < n ? uint (src.read (linePixel (p.srcOrigin, p.vertical, line, first + j)).r * 255.0 + 0.5) : 0u;
+
+    for (uint pass = 0; pass < p.passes; ++pass)
+    {
+        const uint fromLeft = simd_shuffle_up (v[15], 1u);
+        const uint fromRight = simd_shuffle_down (v[0], 1u);
+        uint previous = lane > 0 ? fromLeft : 0u;
+
+        for (uint j = 0; j < 16; ++j)
+        {
+            const uint next = j < 15 ? v[j + 1] : (lane + 1 < simdWidth ? fromRight : 0u);
+            const uint current = v[j];
+            v[j] = first + j < n ? (previous + current + next + 1) / 3 : 0u; // past the end stays 0
+            previous = current;
+        }
+    }
+
+    for (uint j = 0; j < 16; ++j)
+        if (first + j < n)
+            dst.write (float4 (float (v[j]) / 255.0), linePixel (p.dstOrigin, p.vertical, line, first + j));
 }
 )MSL";
 
@@ -1238,6 +1799,18 @@ public:
         completedFrame = completed;
     }
 
+    /*  Any thread: a texture (not from this cache) that recorded frames may still read, released
+        with the textures this cache drops.
+    */
+    void releaseLater (id<MTLTexture> texture)
+    {
+        if (texture == nil)
+            return;
+
+        const ScopedLock sl (lock);
+        dropped.push_back (texture);
+    }
+
     /*  Message thread, at the start of a frame: the textures dropped since the last frame, to be
         released once the frames now in flight have completed.
     */
@@ -1403,7 +1976,7 @@ public:
         queue = [device newCommandQueue];
 
         NSError* error = nil;
-        id<MTLLibrary> library = [device newLibraryWithSource: (NSString* _Nonnull) [NSString stringWithUTF8String: shaderSource]
+        library = [device newLibraryWithSource: (NSString* _Nonnull) [NSString stringWithUTF8String: shaderSource]
                                                       options: nil
                                                         error: &error];
 
@@ -1414,66 +1987,8 @@ public:
             return;
         }
 
-        id<MTLFunction> vs = [library newFunctionWithName: @"vs"];
-        id<MTLFunction> fsClear = [library newFunctionWithName: @"fsClear"];
-
-        auto* desc = [[MTLRenderPipelineDescriptor alloc] init];
-        desc.vertexFunction = vs;
-        desc.depthAttachmentPixelFormat = depthFormat; // window and layer passes test painter's depth
-        auto* attachment = desc.colorAttachments[0];
-        attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        attachment.blendingEnabled = YES; // factors per blend mode below
-        // One fragment function per instance family (see 'family' in the shader).
-        id<MTLFunction> familyFunctions[numFamilies] {};
-
-        for (uint32_t f = 0; f < (uint32_t) numFamilies; ++f)
-        {
-            auto* constants = [[MTLFunctionConstantValues alloc] init];
-            [constants setConstantValue: &f type: MTLDataTypeUInt atIndex: 0];
-            familyFunctions[f] = [library newFunctionWithName: @"fs" constantValues: constants error: &error];
-            [constants release];
-        }
-
-        // juce::BlendMode's other Porter-Duff operators (the colour is premultiplied and already
-        // scaled by coverage, as the software renderer scales the source by its alpha level):
-        // source R = S, destinationIn R = D * Sa, destinationOut R = D * (1 - Sa).
-        const MTLBlendFactor blendFactors[4][2] { { MTLBlendFactorOne,  MTLBlendFactorOneMinusSourceAlpha },   // sourceOver
-                                                  { MTLBlendFactorOne,  MTLBlendFactorZero },                  // source
-                                                  { MTLBlendFactorZero, MTLBlendFactorSourceAlpha },           // destinationIn
-                                                  { MTLBlendFactorZero, MTLBlendFactorOneMinusSourceAlpha } }; // destinationOut
-
-        for (int f = 0; f < numFamilies; ++f)
-        {
-            // A family whose function failed to specialise keeps nil pipelines: isValid() then
-            // refuses the renderer (a pipeline without a fragment function would draw nothing).
-            if (familyFunctions[f] == nil)
-                continue;
-
-            desc.fragmentFunction = familyFunctions[f];
-
-            for (int b = 0; b < 4; ++b)
-            {
-                attachment.sourceRGBBlendFactor = attachment.sourceAlphaBlendFactor = blendFactors[b][0];
-                attachment.destinationRGBBlendFactor = attachment.destinationAlphaBlendFactor = blendFactors[b][1];
-                blendPipelines[f][b] = [device newRenderPipelineStateWithDescriptor: desc error: &error];
-            }
-
-            [familyFunctions[f] release];
-        }
-
-        desc.vertexFunction = vs;
-        desc.fragmentFunction = fsClear;
-        attachment.blendingEnabled = NO;
-        clearPipeline = [device newRenderPipelineStateWithDescriptor: desc error: &error];
-
-        // Opaque interiors: their colour as is, no blending (blending is still off from clearPipeline).
-        id<MTLFunction> vsOpaque = [library newFunctionWithName: @"vsOpaque"];
-        id<MTLFunction> fsOpaque = [library newFunctionWithName: @"fsOpaque"];
-        desc.vertexFunction = vsOpaque;
-        desc.fragmentFunction = fsOpaque;
-        opaquePipeline = [device newRenderPipelineStateWithDescriptor: desc error: &error];
-        [vsOpaque release];
-        [fsOpaque release];
+        vs = [library newFunctionWithName: @"vs"];
+        drawPipelines[0] = createDrawPipelines (false);
 
         auto* depthDesc = [[MTLDepthStencilDescriptor alloc] init];
         depthDesc.depthCompareFunction = MTLCompareFunctionLess;
@@ -1484,9 +1999,10 @@ public:
         depthTestState = [device newDepthStencilStateWithDescriptor: depthDesc];
         [depthDesc release];
 
-        // The mask and coverage passes below have no depth attachment.
-        desc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+        auto* desc = [[MTLRenderPipelineDescriptor alloc] init];
+        auto* attachment = desc.colorAttachments[0];
 
+        // The mask and coverage passes below have no depth attachment.
         // Clip mask passes: one full quad into an R8 target, no blending.
         id<MTLFunction> maskCoverageFs = [library newFunctionWithName: @"maskCoverageFs"];
         id<MTLFunction> fullQuadVs = [library newFunctionWithName: @"fullQuadVs"];
@@ -1510,20 +2026,30 @@ public:
         desc.vertexFunction = accumVs;
         desc.fragmentFunction = accumFs;
         accumPipeline = [device newRenderPipelineStateWithDescriptor: desc error: &error];
+        id<MTLFunction> strokeAccumVs = [library newFunctionWithName: @"strokeAccumVs"];
+        id<MTLFunction> strokeAccumFs = [library newFunctionWithName: @"strokeAccumFs"];
+        desc.vertexFunction = strokeAccumVs;
+        desc.fragmentFunction = strokeAccumFs;
+        strokeAccumPipeline = [device newRenderPipelineStateWithDescriptor: desc error: &error];
+        [strokeAccumVs release];
+        [strokeAccumFs release];
         [accumVs release];
         [accumFs release];
 
         id<MTLFunction> prefixSum = [library newFunctionWithName: @"coveragePrefixSum"];
         prefixSumPipeline = [device newComputePipelineStateWithFunction: prefixSum error: &error];
         [prefixSum release];
+        id<MTLFunction> blur = [library newFunctionWithName: @"boxBlurLines"];
+        blurPipeline = [device newComputePipelineStateWithFunction: blur error: &error];
+        [blur release];
+        id<MTLFunction> blurSimd = [library newFunctionWithName: @"boxBlurLinesSimd"];
+        blurSimdPipeline = [device newComputePipelineStateWithFunction: blurSimd error: &error];
+        [blurSimd release];
         [maskCoverageFs release];
         [fullQuadVs release];
         [maskImageFs release];
 
         [desc release];
-        [vs release];
-        [fsClear release];
-        [library release];
 
         auto* samplerDesc = [[MTLSamplerDescriptor alloc] init];
         samplerDesc.sAddressMode = samplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
@@ -1557,20 +2083,22 @@ public:
         [linearRepeatSampler release];
         [nearestRepeatSampler release];
         [nearestSampler release];
-        [clearPipeline release];
+
+        for (auto& p : drawPipelines)
+            p.release();
+
+        [blurPipeline release];
+        [blurSimdPipeline release];
+        [vs release];
+        [library release];
         [maskCoveragePipeline release];
         [maskImagePipeline release];
         [accumPipeline release];
         [prefixSumPipeline release];
+        [strokeAccumPipeline release];
         [noMask release];
-        [opaquePipeline release];
         [depthWriteState release];
         [depthTestState release];
-
-        for (auto& family : blendPipelines)
-            for (auto p : family)
-                [p release];
-
         [queue release];
         [device release];
         dispatch_release (encodeQueue);
@@ -1578,21 +2106,67 @@ public:
 
     bool isValid() const noexcept
     {
-        return clearPipeline != nil && opaquePipeline != nil
+        return drawPipelines[0].isValid()
             && depthWriteState != nil && depthTestState != nil
-            && std::all_of (std::begin (blendPipelines), std::end (blendPipelines),
-                            [] (const auto& family) { return std::all_of (std::begin (family), std::end (family), [] (auto p) { return p != nil; }); })
-            && maskCoveragePipeline != nil && maskImagePipeline != nil && accumPipeline != nil && prefixSumPipeline != nil && noMask != nil;
+            && maskCoveragePipeline != nil && maskImagePipeline != nil && accumPipeline != nil && prefixSumPipeline != nil
+            && strokeAccumPipeline != nil && noMask != nil;
+    }
+
+    static constexpr int numFamilies = 4;
+
+    /*  The pipelines drawing instances into a target: BGRA8 (windows, layers, ARGB and RGB images)
+        or R8 (single-channel images, see 'alphaTarget' in the shader).
+    */
+    struct DrawPipelines
+    {
+        id<MTLRenderPipelineState> blend[numFamilies][4] {}; // [instance family][juce::BlendMode]
+        id<MTLRenderPipelineState> clear = nil, opaque = nil;
+
+        bool isValid() const noexcept
+        {
+            return clear != nil && opaque != nil
+                && std::all_of (std::begin (blend), std::end (blend),
+                                [] (const auto& family) { return std::all_of (std::begin (family), std::end (family), [] (auto p) { return p != nil; }); });
+        }
+
+        void release()
+        {
+            for (auto& family : blend)
+                for (auto p : family)
+                    [p release];
+
+            [clear release];
+            [opaque release];
+            *this = {};
+        }
+    };
+
+    /*  Any thread. The R8 pipelines are only built once a single-channel image is made. */
+    const DrawPipelines& getDrawPipelines (bool alphaTarget)
+    {
+        if (! alphaTarget)
+            return drawPipelines[0];
+
+        std::call_once (alphaPipelinesBuilt, [this] { drawPipelines[1] = createDrawPipelines (true); });
+        return drawPipelines[1];
+    }
+
+    // The box blur's threadgroups: 256 threads, lines of up to 64 pixels per thread (see boxBlurLines).
+    static constexpr NSUInteger blurThreads = 256, blurPixelsPerLane = 16; // see boxBlurLinesSimd
+    static constexpr int maxBlurLine = 16384;
+
+    bool canBlur() const noexcept
+    {
+        return blurPipeline != nil && blurPipeline.maxTotalThreadsPerThreadgroup >= blurThreads && blurSimdPipeline != nil;
     }
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLRenderPipelineState> clearPipeline = nil, opaquePipeline = nil;
     id<MTLDepthStencilState> depthWriteState = nil, depthTestState = nil;
     static constexpr MTLPixelFormat depthFormat = MTLPixelFormatDepth32Float;
-    static constexpr int numFamilies = 4;
-    id<MTLRenderPipelineState> blendPipelines[numFamilies][4] {}; // [instance family][juce::BlendMode]
+    id<MTLComputePipelineState> blurPipeline = nil, blurSimdPipeline = nil;
     id<MTLRenderPipelineState> maskCoveragePipeline = nil, maskImagePipeline = nil, accumPipeline = nil;
+    id<MTLRenderPipelineState> strokeAccumPipeline = nil;
     id<MTLComputePipelineState> prefixSumPipeline = nil;
     id<MTLTexture> noMask = nil;
     id<MTLSamplerState> nearestSampler = nil, linearSampler = nil, nearestRepeatSampler = nil, linearRepeatSampler = nil;
@@ -1608,7 +2182,7 @@ public:
 
     // Frames of all windows, numbered in recording order (= encoding and GPU order: one encode
     // queue, one command queue), and the last one whose GPU work completed (glyph atlas eviction).
-    uint64_t framesRecorded = 0; // message thread
+    std::atomic<uint64_t> framesRecorded { 0 }; // incremented on the message thread
     std::atomic<uint64_t> framesCompleted { 0 };
 
     // Frames are encoded and committed off the message thread, in the order they were painted.
@@ -1617,6 +2191,114 @@ public:
     dispatch_queue_t encodeQueue = dispatch_queue_create ("juce.MetalRenderer.encode",
                                                           dispatch_queue_attr_make_with_qos_class (DISPATCH_QUEUE_SERIAL,
                                                                                                    QOS_CLASS_USER_INTERACTIVE, 0));
+
+private:
+    DrawPipelines createDrawPipelines (bool alphaTarget) const
+    {
+        DrawPipelines result;
+        NSError* error = nil;
+        auto* desc = [[MTLRenderPipelineDescriptor alloc] init];
+        desc.vertexFunction = vs;
+        desc.depthAttachmentPixelFormat = depthFormat; // window and layer passes test painter's depth
+        auto* attachment = desc.colorAttachments[0];
+        attachment.pixelFormat = alphaTarget ? MTLPixelFormatR8Unorm : MTLPixelFormatBGRA8Unorm;
+        attachment.blendingEnabled = YES; // factors per blend mode below
+
+        // juce::BlendMode's other Porter-Duff operators (the colour is premultiplied and already
+        // scaled by coverage, as the software renderer scales the source by its alpha level):
+        // source R = S, destinationIn R = D * Sa, destinationOut R = D * (1 - Sa).
+        const MTLBlendFactor blendFactors[4][2] { { MTLBlendFactorOne,  MTLBlendFactorOneMinusSourceAlpha },   // sourceOver
+                                                  { MTLBlendFactorOne,  MTLBlendFactorZero },                  // source
+                                                  { MTLBlendFactorZero, MTLBlendFactorSourceAlpha },           // destinationIn
+                                                  { MTLBlendFactorZero, MTLBlendFactorOneMinusSourceAlpha } }; // destinationOut
+
+        // One fragment function per instance family (see 'family' in the shader). A family whose
+        // function fails to specialise keeps nil pipelines: isValid() then refuses them (a
+        // pipeline without a fragment function would draw nothing).
+        for (uint32_t f = 0; f < (uint32_t) numFamilies; ++f)
+        {
+            auto* constants = [[MTLFunctionConstantValues alloc] init];
+            const bool alpha = alphaTarget;
+            [constants setConstantValue: &f type: MTLDataTypeUInt atIndex: 0];
+            [constants setConstantValue: &alpha type: MTLDataTypeBool atIndex: 1];
+            id<MTLFunction> fs = [library newFunctionWithName: @"fs" constantValues: constants error: &error];
+            [constants release];
+
+            if (fs == nil)
+                continue;
+
+            desc.fragmentFunction = fs;
+
+            for (int b = 0; b < 4; ++b)
+            {
+                attachment.sourceRGBBlendFactor = attachment.sourceAlphaBlendFactor = blendFactors[b][0];
+                attachment.destinationRGBBlendFactor = attachment.destinationAlphaBlendFactor = blendFactors[b][1];
+                result.blend[f][b] = [device newRenderPipelineStateWithDescriptor: desc error: &error];
+            }
+
+            [fs release];
+        }
+
+        id<MTLFunction> fsClear = [library newFunctionWithName: @"fsClear"];
+        desc.fragmentFunction = fsClear;
+        attachment.blendingEnabled = NO;
+        result.clear = [device newRenderPipelineStateWithDescriptor: desc error: &error];
+        [fsClear release];
+
+        // Opaque interiors: their colour as is, no blending.
+        id<MTLFunction> vsOpaque = [library newFunctionWithName: @"vsOpaque"];
+        id<MTLFunction> fsOpaque = [library newFunctionWithName: alphaTarget ? @"fsOpaqueAlpha" : @"fsOpaque"];
+        desc.vertexFunction = vsOpaque;
+        desc.fragmentFunction = fsOpaque;
+        result.opaque = [device newRenderPipelineStateWithDescriptor: desc error: &error];
+        [vsOpaque release];
+        [fsOpaque release];
+        [desc release];
+        return result;
+    }
+
+    id<MTLLibrary> library = nil;
+    id<MTLFunction> vs = nil;
+    DrawPipelines drawPipelines[2]; // BGRA8, R8
+    std::once_flag alphaPipelinesBuilt;
+};
+
+//==============================================================================
+/*  A 64-bit hash of recorded content (FrameRecorder::contentKey). */
+struct ContentHasher
+{
+    void bytes (const void* data, size_t size)
+    {
+        auto* p = static_cast<const uint8*> (data);
+
+        for (; size >= 8; p += 8, size -= 8)
+        {
+            uint64_t w;
+            memcpy (&w, p, 8);
+            mix (w);
+        }
+
+        uint64_t tail = 0;
+        memcpy (&tail, p, size);
+        mix (tail ^ ((uint64_t) size << 56));
+    }
+
+    template <typename... T>
+    void values (T... v) { (bytes (&v, sizeof (v)), ...); }
+
+    template <typename T>
+    void all (const std::vector<T>& v)
+    {
+        static_assert (std::is_trivially_copyable_v<T>);
+        values (v.size());
+        bytes (v.data(), v.size() * sizeof (T));
+    }
+
+    void rect (Rectangle<int> r) { values (r.getX(), r.getY(), r.getWidth(), r.getHeight()); }
+    void transform (const AffineTransform& t) { values (t.mat00, t.mat01, t.mat02, t.mat10, t.mat11, t.mat12); }
+    void mix (uint64_t w) { h = (h ^ w) * 0x9e3779b97f4a7c15ull; h ^= h >> 32; }
+
+    uint64_t h = 0xcbf29ce484222325ull;
 };
 
 //==============================================================================
@@ -1682,8 +2364,71 @@ struct FrameRecorder
         [[nodiscard]] bool readsCoverage() const noexcept { return coveragePage >= 0 && parent < 0; }
     };
 
+    /*  A key for what was recorded, so that what it renders can be cached (see ImageQueue's blurred
+        contents), or 0 when it draws something a key can't identify: images (their pixels can
+        change under the same texture) and glyphs (their place in the atlas can be reused).
+    */
+    uint64_t contentKey() const
+    {
+        if (! glyphJobs.empty())
+            return 0;
+
+        ContentHasher hash;
+
+        for (const auto& target : targets)
+        {
+            for (const auto& b : target.batches)
+            {
+                if (b.image != nil || b.family == 1)
+                    return 0;
+
+                hash.values (b.nearest, b.first, b.count, b.mask, b.layer, b.repeat, b.coveragePage, (int) b.blend, b.family, b.segmented);
+            }
+
+            hash.rect (target.area);
+            hash.values (target.texWidth, target.texHeight);
+            hash.all (target.opaque);
+        }
+
+        for (const auto& m : masks)
+        {
+            if (m.image != nil)
+                return 0;
+
+            hash.rect (m.area);
+            hash.values (m.texWidth, m.texHeight, m.parent, m.coveragePage, m.inv0, m.inv1, m.imageWidth, m.imageHeight,
+                         m.imageIsAlphaOnly, m.nearest);
+        }
+
+        for (const auto& job : coverageJobs)
+        {
+            hash.values (job.path.isUsingNonZeroWinding());
+
+            for (Path::Iterator it (job.path); it.next();)
+                hash.values (it.elementType, it.x1, it.y1, it.x2, it.y2, it.x3, it.y3);
+
+            hash.transform (job.toDevice);
+            hash.values (job.stroke.getStrokeThickness(), job.stroke.getJointStyle(), job.stroke.getEndStyle(),
+                         job.stroke.getMiterLimit(), job.strokeAccuracy, job.atlasOrigin, job.page);
+            hash.transform (job.strokeTransform);
+            hash.rect (job.area);
+        }
+
+        for (const auto& page : coveragePages)
+            hash.values (page.width, page.height, page.evenOdd);
+
+        hash.all (instances);
+        hash.all (clears);
+        hash.all (gradients);
+        hash.all (gradientStops);
+        hash.all (encodeOrder);
+        hash.values (clearMain);
+        return hash.h != 0 ? hash.h : 1;
+    }
+
     void clear (Rectangle<int> mainArea)
     {
+        clearMain = false;
         instances.clear();
         clears.clear();
         targets.clear();
@@ -1698,6 +2443,10 @@ struct FrameRecorder
         coverageSegments.clear();
         coverageEntries.clear();
         coveragePages.clear();
+        strokePoints.clear();
+        strokeSubs.clear();
+        strokeJobs.clear();
+        strokeQuads.clear();
         shelfX = shelfY = shelfHeight = 0;
     }
 
@@ -1712,9 +2461,35 @@ struct FrameRecorder
         uint32_t firstSegment = 0, segmentCount = 0, firstEntry = 0, entryCount = 0, rowCount = 0;
         id<MTLTexture> deltas = nil, coverage = nil; // allocated at encode time
         bool evenOdd = false;                        // holds an even-odd path (see the coverage format)
+        uint32_t firstStrokeQuad = 0, strokeQuadCount = 0; // its strokes' quads (see strokeAccumVs)
     };
 
+    // Stroke expansion's input (see strokeAccumVs in the shader).
+    static constexpr uint32_t strokeEdgesPerQuad = 8;                                                        // must match 'strokeEdgesPerQuad'
+    struct StrokeJobData { Float4 xf0, xf1, rect, style; uint32_t joint, cap, capEdges, maxArcSteps; }; // must match 'StrokeJob'
+    struct StrokeSub { uint32_t first, count, closed, job; };                                          // must match 'StrokeSub'
+    struct StrokeQuad { uint32_t point, subAndEdge; };                                                 // must match 'StrokeQuad'
+    struct StrokePoint { float x, y; };                                                                      // must match 'StrokePoint'
+
     static constexpr int coveragePageWidth = 2048, coveragePageMaxHeight = 4096;
+
+    /*  Tested and not kept, measured on an M1 (Metal System Trace) and on a busy plug-in page:
+        - Triangulating paths into anti-aliased meshes (an earlier version of this renderer): on
+          GraphicsDemo's stroked paths, rebuilt every frame so that no mesh cache helps, 87% of
+          the time went into triangulation (sorting vertices, resolving intersections), and some
+          SVG paths failed to triangulate (about 6 per frame in its SVG demo).
+        - Sparse coverage, as tile-based renderers do: a path's area cut into 32 x 16 tiles, only
+          the runs of tiles its edges touch summed and composited, the others drawn solid or not at
+          all from a winding number counted on the CPU (from the edges crossing each tile row's
+          top; horizontal edges must mark their tiles too). 5% off the composite and 7-33% off the
+          prefix sums, about 0.05 ms per frame (some 4% of that page's GPU time), for ~400 lines
+          and a CPU winding count that must match the GPU's sums exactly. The composite's empty
+          pixels were already cheap: one read, then discarded.
+        - Caching the coverage of paths unchanged from the previous frame: on that page (animated
+          modulations and histories) no path repeated.
+        - Flattening fills on the GPU: it must place vertices as PathFlatteningIterator does to keep
+          EdgeTable's pixels, and the whole encoding was 0.2 ms per frame on that page.
+    */
 
     /*  A path whose coverage the frame needs. paint() only records it (a copy of the path, its
         place in the atlas); its outline is built and flattened into segments on the encode thread
@@ -1746,8 +2521,9 @@ struct FrameRecorder
         return job.page;
     }
 
-    /*  The same for the outline of a stroke (PathStrokeType::createStrokedPath (outline, path,
-        strokeTransform, accuracy)), drawn through 'toDevice'.
+    /*  The same for a stroke of 'path' (transformed by 'strokeTransform', flattened with
+        'accuracy', as PathStrokeType::createStrokedPath), drawn through 'toDevice'. Its outline
+        is built on the GPU (strokeAccumVs).
     */
     int addCoverageStroke (const Path& path, const PathStrokeType& stroke, const AffineTransform& strokeTransform,
                            float accuracy, const AffineTransform& toDevice, Rectangle<int> area, Point<int>& atlasOrigin)
@@ -1763,12 +2539,16 @@ struct FrameRecorder
     }
 
     /*  Encode thread, before the segments are uploaded: flattens each recorded path into its
-        page's segments (pages hold consecutive jobs).
+        page's segments, and each stroke's centre line into the stroke expansion's input (pages
+        hold consecutive jobs).
     */
     void resolveCoverage()
     {
         coverageSegments.clear();
-        Path outline;
+        strokePoints.clear();
+        strokeSubs.clear();
+        strokeJobs.clear();
+        strokeQuads.clear();
         auto lastPage = -1;
 
         for (const auto& job : coverageJobs)
@@ -1779,23 +2559,267 @@ struct FrameRecorder
             {
                 page.firstSegment = (uint32_t) coverageSegments.size();
                 page.segmentCount = 0;
+                page.firstStrokeQuad = (uint32_t) strokeQuads.size();
+                page.strokeQuadCount = 0;
                 lastPage = job.page;
             }
 
             const auto first = coverageSegments.size();
+            const auto firstQuad = strokeQuads.size();
 
             if (job.stroke.getStrokeThickness() > 0.0f)
+                addStroke (job);
+            else
+                addSegments (job.path, job);
+
+            page.segmentCount += (uint32_t) (coverageSegments.size() - first);
+            page.strokeQuadCount += (uint32_t) (strokeQuads.size() - firstQuad);
+        }
+    }
+
+    /*  A stroke's centre line, flattened as PathStrokeType::createStrokedPath does it (in the
+        stroke's space, with its tolerance, merging segments shorter than its minimum), and the
+        parameters with which strokeAccumVs builds its outline.
+    */
+    void addStroke (const CoverageJob& job)
+    {
+        const auto& stroke = job.stroke;
+        const auto& xf = job.toDevice;
+        const auto halfWidth = 0.5f * stroke.getStrokeThickness();
+
+        // Arcs (round joins and caps) in steps whose sagitta is at most 0.1 device pixel, at the
+        // transform's largest scale (its largest singular value), and at most 64 per half turn.
+        const auto sumSquares = xf.mat00 * xf.mat00 + xf.mat01 * xf.mat01 + xf.mat10 * xf.mat10 + xf.mat11 * xf.mat11;
+        const auto rowDifference = xf.mat00 * xf.mat00 + xf.mat01 * xf.mat01 - xf.mat10 * xf.mat10 - xf.mat11 * xf.mat11;
+        const auto rowDot = xf.mat00 * xf.mat10 + xf.mat01 * xf.mat11;
+        const auto maxScale = std::sqrt (0.5f * (sumSquares + std::sqrt (rowDifference * rowDifference + 4.0f * rowDot * rowDot)));
+        const auto radius = halfWidth * maxScale;
+        constexpr auto tolerance = 0.1f, pi = MathConstants<float>::pi;
+        const auto step = jmax (pi / 64.0f, radius > tolerance ? 2.0f * std::acos (1.0f - tolerance / radius) : pi);
+        const auto maxArcSteps = (uint32_t) jlimit (1.0f, 64.0f, std::ceil (pi / step));
+
+        // The edges each point owns (see strokeAccumVs): two offset edges and a join (miter: an
+        // edge to the miter point and two bevels; bevel: two; round: a bevel and the arc's steps,
+        // counted here when they could take more than a quad, with one to spare for rounding, else
+        // the most a half turn takes); an open sub-path's first and last points have a cap each
+        // (butt: one edge; square: three; round: an arc).
+        const auto joint = stroke.getJointStyle();
+        const auto cap = stroke.getEndStyle();
+        const auto capEdges = cap == PathStrokeType::square ? 3u : (cap == PathStrokeType::rounded ? maxArcSteps : 1u);
+        const auto countArcSteps = joint == PathStrokeType::curved && 2 + 1 + maxArcSteps > strokeEdgesPerQuad;
+        const auto miterLimit = jmax (1.0f, stroke.getMiterLimit());
+
+        const auto joinEdgesAt = [&] (size_t first, size_t n, size_t j) -> uint32_t
+        {
+            if (joint == PathStrokeType::mitered)
+                return 3;
+
+            if (joint == PathStrokeType::beveled)
+                return 2;
+
+            if (! countArcSteps)
+                return 1 + maxArcSteps;
+
+            const auto& b = strokePoints[first + (j + n - 1) % n];
+            const auto& p = strokePoints[first + j % n];
+            const auto& a = strokePoints[first + (j + 1) % n];
+            const auto t0 = Point<float> (p.x - b.x, p.y - b.y), t1 = Point<float> (a.x - p.x, a.y - p.y);
+            const auto turn = std::abs (std::atan2 (t0.x * t1.y - t0.y * t1.x, t0.x * t1.x + t0.y * t1.y));
+            return jmax (2u, 1 + jmin (maxArcSteps, (uint32_t) std::ceil (turn / step) + 1));
+        };
+
+        const auto dx = (float) (job.atlasOrigin.x - job.area.getX()), dy = (float) (job.atlasOrigin.y - job.area.getY());
+        const auto jobIndex = (uint32_t) strokeJobs.size();
+        strokeJobs.push_back ({ { xf.mat00, xf.mat01, xf.mat02 + dx, 0.0f },
+                                { xf.mat10, xf.mat11, xf.mat12 + dy, 0.0f },
+                                { (float) job.atlasOrigin.x, (float) job.atlasOrigin.y,
+                                  (float) (job.atlasOrigin.x + job.area.getWidth()), (float) (job.atlasOrigin.y + job.area.getHeight()) },
+                                { halfWidth, square (miterLimit), step, 0.0f },
+                                (uint32_t) joint, (uint32_t) cap, capEdges, maxArcSteps });
+
+        // Only the part of the centre line that can reach the area is kept: segments beyond
+        // where the outline reaches (half the width, times the miter limit or sqrt 2 for square
+        // caps, plus a pixel) are dropped and those crossing that margin are cut there, so that a
+        // long path mostly outside the area costs nothing, and no edge starts so far away that its
+        // coordinates lose precision. The ends this makes, and their caps, lie outside the area.
+        Rectangle<float> keep;
+        const auto rowDifferenceMin = sumSquares - std::sqrt (rowDifference * rowDifference + 4.0f * rowDot * rowDot);
+        const auto minScale = std::sqrt (jmax (0.0f, 0.5f * rowDifferenceMin));
+        const auto cull = minScale > 1.0e-6f;
+
+        if (cull)
+        {
+            const auto reach = halfWidth * jmax (joint == PathStrokeType::mitered ? miterLimit : 1.0f,
+                                                 cap == PathStrokeType::square ? MathConstants<float>::sqrt2 : 1.0f);
+            keep = job.area.toFloat().transformedBy (xf.inverted()).expanded (reach + 1.0f / minScale);
+        }
+
+        auto subFirst = strokePoints.size();
+        auto closed = false, cut = false;
+
+        const auto addPoint = [&] (Point<float> p)
+        {
+            if (strokePoints.size() > subFirst && exactlyEqual (strokePoints.back().x, p.x) && exactlyEqual (strokePoints.back().y, p.y))
+                return;
+
+            strokePoints.push_back ({ p.x, p.y });
+        };
+
+        const auto endSubPath = [&]
+        {
+            const auto isClosed = closed && ! cut;
+            auto count = strokePoints.size() - subFirst;
+
+            // A closed sub-path's last point is its first.
+            if (isClosed && count > 1)
             {
-                job.stroke.createStrokedPath (outline, job.path, job.strokeTransform, job.strokeAccuracy);
-                addSegments (outline, job);
+                strokePoints.pop_back();
+                --count;
+            }
+
+            if (count >= 2)
+            {
+                // Its points' quads, eight edges each.
+                const auto subIndex = (uint32_t) strokeSubs.size();
+                jassert (subIndex < (1u << 24));
+                strokeSubs.push_back ({ (uint32_t) subFirst, (uint32_t) count, isClosed ? 1u : 0u, jobIndex });
+                const auto segments = isClosed ? count : count - 1;
+
+                for (size_t k = 0; k < count; ++k)
+                {
+                    uint32_t edges = capEdges;
+
+                    if (k < segments)
+                    {
+                        edges = 2 + (k == 0 && ! isClosed ? capEdges : 0u);
+
+                        if (k + 1 < segments || isClosed)
+                            edges += joinEdgesAt (subFirst, count, k + 1);
+                    }
+
+                    for (uint32_t e = 0; e < edges; e += strokeEdgesPerQuad)
+                        strokeQuads.push_back ({ (uint32_t) (subFirst + k), subIndex << 8 | e });
+                }
             }
             else
             {
-                addSegments (job.path, job);
+                strokePoints.resize (subFirst);
             }
 
-            page.segmentCount += (uint32_t) (coverageSegments.size() - first);
+            subFirst = strokePoints.size();
+            closed = false;
+        };
+
+        const auto addSegment = [&] (Point<float> from, Point<float> to)
+        {
+            auto a = from, b = to;
+
+            if (cull && ! clipToRectangle (a, b, keep))
+            {
+                cut = true;
+                endSubPath();
+                return;
+            }
+
+            if (a != from)
+            {
+                cut = true;
+                endSubPath();
+            }
+
+            if (strokePoints.size() == subFirst)
+                addPoint (a);
+
+            addPoint (b);
+
+            if (b != to)
+            {
+                cut = true;
+                endSubPath();
+            }
+        };
+
+        // PathStrokeHelpers::createStroke's iteration: a segment is kept if it is long enough,
+        // closes its sub-path or ends it; a short one is merged into the next.
+        constexpr auto minSegmentLengthSquared = 0.0001f;
+        Point<float> start;
+
+        for (PathFlatteningIterator it (job.path, job.strokeTransform, Path::defaultToleranceForMeasurement / job.strokeAccuracy); it.next();)
+        {
+            if (it.subPathIndex == 0)
+            {
+                endSubPath();
+                cut = false;
+                start = { it.x1, it.y1 };
+            }
+
+            const auto segmentX = it.x2 - start.x, segmentY = it.y2 - start.y;
+
+            if (it.closesSubPath || segmentX * segmentX + segmentY * segmentY > minSegmentLengthSquared || it.isLastInSubpath())
+            {
+                addSegment (start, { it.x2, it.y2 });
+
+                if (it.closesSubPath)
+                {
+                    closed = true;
+                    endSubPath();
+                    cut = false;
+                }
+
+                start = { it.x2, it.y2 };
+            }
         }
+
+        endSubPath();
+    }
+
+    // Liang-Barsky: clips the segment a-b to r, false if none of it is inside.
+    static bool clipToRectangle (Point<float>& a, Point<float>& b, Rectangle<float> r) noexcept
+    {
+        if (r.contains (a) && r.contains (b))
+            return true;
+
+        const auto d = b - a;
+        auto t0 = 0.0f, t1 = 1.0f;
+
+        const auto clipAgainst = [&] (float p, float q)
+        {
+            if (exactlyEqual (p, 0.0f))
+                return q >= 0.0f;
+
+            const auto t = q / p;
+
+            if (p < 0.0f)
+            {
+                if (t > t1)
+                    return false;
+
+                t0 = jmax (t0, t);
+            }
+            else
+            {
+                if (t < t0)
+                    return false;
+
+                t1 = jmin (t1, t);
+            }
+
+            return true;
+        };
+
+        if (! (clipAgainst (-d.x, a.x - r.getX()) && clipAgainst (d.x, r.getRight() - a.x)
+               && clipAgainst (-d.y, a.y - r.getY()) && clipAgainst (d.y, r.getBottom() - a.y)))
+            return false;
+
+        const auto origin = a;
+
+        if (t1 < 1.0f)
+            b = origin + d * t1;
+
+        if (t0 > 0.0f)
+            a = origin + d * t0;
+
+        return true;
     }
 
     CoverageJob& addCoverageJob (Rectangle<int> area, bool evenOdd)
@@ -1934,6 +2958,9 @@ struct FrameRecorder
         Each batch's area is WebRender's BatchRects: the union of its draws' bounds, plus the
         bounds themselves once the union is a poor fit (larger than their sum); a long list of
         them reverts to the union alone, which only stops searches earlier.
+        Tested and not kept: sorting the whole frame's draws (by group of non-overlapping draws in
+        painter's order, then by pipeline) gave the same batches on a widget grid for 0.7 ms more
+        encoding per full repaint.
         Rebuilds the target's batches over the new sequence, which starts at 'first' (in batch
         units) and returns the target's instance indices in that sequence. Encode thread.
     */
@@ -2190,6 +3217,10 @@ struct FrameRecorder
     std::vector<Mask> masks;
     std::vector<CoverageJob> coverageJobs;
     std::vector<CoverageSegment> coverageSegments; // filled by resolveCoverage
+    std::vector<StrokePoint> strokePoints;          // the same, for strokeAccumVs
+    std::vector<StrokeSub> strokeSubs;
+    std::vector<StrokeJobData> strokeJobs;
+    std::vector<StrokeQuad> strokeQuads;            // the quads of strokeAccumVs
     std::vector<CoverageEntry> coverageEntries;
     std::vector<CoveragePage> coveragePages;
     int shelfX = 0, shelfY = 0, shelfHeight = 0;
@@ -2201,9 +3232,1433 @@ struct FrameRecorder
     ImageTextureCache* imageCache = nullptr;
     std::map<std::string, int> fallbackReasons; // only filled when statistics are enabled
     bool collectReasons = false;
+    id<MTLTexture> destination = nil;   // an image's texture, drawn into (nil: a window's)
+    bool clearMain = false;             // the main target starts cleared (else it keeps its pixels)
+};
+
+//==============================================================================
+/*  The shared buffers a recorded scene is uploaded to for its encoding (SceneEncoder::encode),
+    reused frame after frame once the GPU has read them.
+*/
+struct EncodeBuffers
+{
+    id<MTLBuffer> instances = nil, gradients = nil, coverageSegments = nil, coverageEntries = nil, opaqueIndices = nil, gradientStops = nil;
+    id<MTLBuffer> strokePoints = nil, strokeSubs = nil, strokeJobs = nil, strokeQuads = nil;
+
+    void release()
+    {
+        for (auto b : { instances, gradients, coverageSegments, coverageEntries, opaqueIndices, gradientStops,
+                        strokePoints, strokeSubs, strokeJobs, strokeQuads })
+            [b release];
+
+        *this = {};
+    }
+};
+
+/*  What a window's statistics (JUCE_METAL_RENDERER_STATS) take from the encoding. */
+struct EncodeStatistics
+{
+    std::atomic<int64> phaseMicros[3] {};
+    std::atomic<double> frameGpuStart { 0.0 };
+    int64 drawCallsTotal = 0; // instance batches after reordering, encode queue
+};
+
+/*  GPU work on a MetalPixelData's texture, queued in order (ImageQueue) and encoded before the
+    passes of the next window frame, in its command buffer, or earlier when the image's pixels
+    are read (ImageQueue::readBack).
+*/
+struct ImageJob
+{
+    enum class Kind { render, blur, copy, upload, clear };
+
+    ImageJob() = default;
+    ~ImageJob() { reset(); buffers.release(); }
+
+    // Once its GPU work has completed: ready to be reused.
+    void reset()
+    {
+        [texture release];
+        [source release];
+        [staging release];
+        texture = source = nil;
+        staging = nil;
+        releases.releaseAll();
+    }
+
+    Kind kind = Kind::render;
+    id<MTLTexture> texture = nil;     // the image's texture, written (retained)
+    id<MTLTexture> source = nil;      // copy: the texture read (retained)
+    id<MTLBuffer> staging = nil;      // upload: the pixels, packed rows (retained)
+    NSUInteger stagingBytesPerRow = 0;
+    Rectangle<int> area;              // blur
+    int passes = 0;                   // blur: 3-tap passes along each line
+    FrameRecorder recorder;           // render: what a MetalGraphicsContext drew
+    EncodeBuffers buffers;            // render
+    DeferredReleases releases;        // render: its software tiles (see endDelegate)
+
+    JUCE_DECLARE_NON_COPYABLE (ImageJob)
+};
+
+//==============================================================================
+/*  Encodes recorded scenes and image jobs into command buffers (encode queue only). */
+class SceneEncoder
+{
+public:
+    explicit SceneEncoder (SharedResources& s) : shared (s) {}
+
+    ~SceneEncoder()
+    {
+        for (auto& p : texturePool)
+            [p.texture release];
+    }
+
+    /*  Mask and layer textures, reused across frames (as the OpenGL renderer keeps its
+        framebuffers). A texture goes back to the pool once the scene that used it has completed;
+        pooled textures unused for 120 scenes of the encoder's owner are released.
+        The smallest pooled texture at least as large as asked is reused (up to four times the
+        area): layers and clips change size from frame to frame as their content moves, and
+        creating a Metal texture is costly. Passes are limited to the size asked
+        (renderTargetWidth / Height), so the rest of a larger texture costs no GPU time.
+    */
+    struct PooledTexture { id<MTLTexture> texture; uint64_t lastUsed; };
+
+    id<MTLTexture> acquireTexture (std::vector<id<MTLTexture>>& pooled, int width, int height, MTLPixelFormat format,
+                                   MTLTextureUsage usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
+                                   MTLStorageMode storage = MTLStorageModePrivate, bool exactSize = false)
+    {
+        const auto areaOf = [] (id<MTLTexture> t) { return (int64) t.width * (int64) t.height; };
+        const auto maxArea = 4 * (int64) width * (int64) height;
+        auto best = texturePool.end();
+
+        for (auto it = texturePool.begin(); it != texturePool.end(); ++it)
+        {
+            const auto t = it->texture;
+
+            const auto sizeFits = exactSize ? ((int) t.width == width && (int) t.height == height)
+                                            : ((int) t.width >= width && (int) t.height >= height);
+
+            if (sizeFits && t.pixelFormat == format && t.usage == usage && t.storageMode == storage
+                 && areaOf (t) <= maxArea && (best == texturePool.end() || areaOf (t) < areaOf (best->texture)))
+            {
+                best = it;
+            }
+        }
+
+        if (best != texturePool.end())
+        {
+            auto texture = best->texture;
+            texturePool.erase (best);
+            pooled.push_back (texture);
+            return texture;
+        }
+
+        auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: format
+                                                                        width: (NSUInteger) width
+                                                                       height: (NSUInteger) height
+                                                                    mipmapped: NO];
+        desc.usage = usage;
+        desc.storageMode = storage;
+        auto texture = [shared.device newTextureWithDescriptor: desc];
+        pooled.push_back (texture);
+        return texture;
+    }
+
+    /*  'pooled' (acquired by a scene whose GPU work has completed) back to the pool, at 'now' (a
+        count of the scenes of the pool's owner).
+    */
+    void recycle (std::vector<id<MTLTexture>>& pooled, uint64_t now)
+    {
+        for (auto t : pooled)
+            texturePool.push_back ({ t, now });
+
+        pooled.clear();
+
+        for (auto it = texturePool.begin(); it != texturePool.end();)
+        {
+            if (now - it->lastUsed > 120)
+            {
+                [it->texture release];
+                it = texturePool.erase (it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    void encodeJob (ImageJob& job, std::vector<id<MTLTexture>>& pooled, id<MTLCommandBuffer>& commandBuffer)
+    {
+        id<MTLTexture> texture = job.texture;
+        const auto origin = MTLOriginMake (0, 0, 0);
+        const auto size = MTLSizeMake (texture.width, texture.height, 1);
+
+        switch (job.kind)
+        {
+            case ImageJob::Kind::render:
+                encode (job.buffers, pooled, job.recorder, commandBuffer, texture, nullptr);
+                return;
+
+            case ImageJob::Kind::blur:
+                encodeBlur (job, pooled, commandBuffer);
+                return;
+
+            case ImageJob::Kind::clear:
+            {
+                auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                pass.colorAttachments[0].texture = texture;
+                pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+                pass.colorAttachments[0].clearColor = MTLClearColorMake (0, 0, 0, 0);
+                pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor: pass];
+                encoder.label = @"JUCE image clear";
+                [encoder endEncoding];
+                return;
+            }
+
+            case ImageJob::Kind::copy:
+            {
+                id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+                blit.label = @"JUCE image copy";
+                [blit copyFromTexture: job.source sourceSlice: 0 sourceLevel: 0 sourceOrigin: origin sourceSize: size
+                            toTexture: texture destinationSlice: 0 destinationLevel: 0 destinationOrigin: origin];
+                [blit endEncoding];
+                return;
+            }
+
+            case ImageJob::Kind::upload:
+            {
+                id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+                blit.label = @"JUCE image upload";
+                [blit copyFromBuffer: job.staging sourceOffset: 0 sourceBytesPerRow: job.stagingBytesPerRow
+                 sourceBytesPerImage: job.stagingBytesPerRow * texture.height sourceSize: size
+                           toTexture: texture destinationSlice: 0 destinationLevel: 0 destinationOrigin: origin];
+                [blit endEncoding];
+                return;
+            }
+        }
+    }
+
+    // Makes a scene's shared buffer hold at least 'bytes' (it grows to twice that, so that a
+    // growing scene doesn't reallocate it every frame).
+    void reserveBuffer (id<MTLBuffer>& buffer, size_t bytes)
+    {
+        bytes = jmax ((size_t) 256, bytes);
+
+        if (buffer == nil || buffer.length < bytes)
+        {
+            [buffer release];
+            buffer = [shared.device newBufferWithLength: bytes * 2 options: MTLResourceStorageModeShared];
+        }
+    }
+
+    template <typename Items>
+    void upload (id<MTLBuffer>& buffer, const Items& items)
+    {
+        using Item = typename Items::value_type;
+        reserveBuffer (buffer, items.size() * sizeof (Item));
+        std::copy (items.begin(), items.end(), static_cast<Item*> (buffer.contents));
+    }
+
+    /*  Encodes a recorded scene into 'commandBuffer' (which statistics may commit and replace, to
+        time the phases apart): its coverage, masks and targets, the main one drawn over
+        'destination'. The textures it takes from the pool are added to 'pooled', its uploads go
+        into 'buffers': both must stay until its GPU work completes.
+    */
+    void encode (EncodeBuffers& buffers, std::vector<id<MTLTexture>>& pooled, FrameRecorder& recorder,
+                 id<MTLCommandBuffer>& commandBuffer, id<MTLTexture> destination, const std::shared_ptr<EncodeStatistics>& stats)
+    {
+        const auto& clears = recorder.clears;
+        const auto& instances = recorder.instances;
+        reserveBuffer (buffers.instances, (clears.size() + instances.size()) * sizeof (MetalRendering::Instance));
+
+        // The clears, then each target's instances in their reordered sequence (see
+        // FrameRecorder::reorder); 'positionOf' maps a recorded instance to its buffer position.
+        auto* dst = static_cast<MetalRendering::Instance*> (buffers.instances.contents);
+        std::copy (clears.begin(), clears.end(), dst);
+        std::vector<uint32_t> positionOf (instances.size(), 0);
+        uint32_t next = 0;
+
+        for (auto& target : recorder.targets)
+        {
+            for (auto index : recorder.reorder (target, next))
+            {
+                dst[clears.size() + next] = instances[index];
+                positionOf[index] = (uint32_t) (clears.size() + next);
+                ++next;
+            }
+
+            if (stats != nullptr)
+                stats->drawCallsTotal += (int64) target.batches.size();
+        }
+
+        upload (buffers.gradients, recorder.gradients);
+        upload (buffers.gradientStops, recorder.gradientStops);
+
+        // Coverage atlas pages first: path fills read them.
+        using FR = MetalRendering::FrameRecorder;
+        upload (buffers.coverageSegments, recorder.coverageSegments);
+        upload (buffers.coverageEntries, recorder.coverageEntries);
+
+        // Stroke expansion's input.
+        if (! recorder.strokePoints.empty())
+        {
+            upload (buffers.strokePoints, recorder.strokePoints);
+            upload (buffers.strokeSubs, recorder.strokeSubs);
+            upload (buffers.strokeJobs, recorder.strokeJobs);
+            upload (buffers.strokeQuads, recorder.strokeQuads);
+        }
+
+        // Statistics: the coverage and mask phases go in their own command buffers, timed apart.
+        const auto endPhase = [&] (int phase)
+        {
+            if (auto phaseStats = stats)
+            {
+                [commandBuffer addCompletedHandler: ^(id<MTLCommandBuffer> done)
+                {
+                    phaseStats->phaseMicros[phase] += (int64) ((done.GPUEndTime - done.GPUStartTime) * 1.0e6);
+
+                    if (phase == 0)
+                        phaseStats->frameGpuStart = done.GPUStartTime;
+                }];
+                [commandBuffer commit];
+                commandBuffer = [shared.queue commandBuffer];
+            }
+        };
+
+        for (auto& page : recorder.coveragePages)
+        {
+            const auto texWidth = FR::pooledSize (page.width), texHeight = FR::pooledSize (page.height);
+            page.deltas = acquireTexture (pooled, texWidth, texHeight, MTLPixelFormatR32Float);
+            // The summed winding numbers fit half floats (2^-10 below 2, under 1/255) for the
+            // non-zero rule, clamped at 1: only the deltas need 32 bits. The even-odd rule reads
+            // the winding modulo 2, which half floats lose with many overlapping layers (a step of
+            // 2^-6 from 16 on): pages holding even-odd paths keep 32 bits.
+            page.coverage = acquireTexture (pooled, texWidth, texHeight, page.evenOdd ? MTLPixelFormatR32Float : MTLPixelFormatR16Float,
+                                            MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
+
+            auto* accumPass = [MTLRenderPassDescriptor renderPassDescriptor];
+            accumPass.colorAttachments[0].texture = page.deltas;
+            accumPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            accumPass.colorAttachments[0].clearColor = MTLClearColorMake (0, 0, 0, 0);
+            accumPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            accumPass.renderTargetWidth = (NSUInteger) texWidth;
+            accumPass.renderTargetHeight = (NSUInteger) texHeight;
+
+            id<MTLRenderCommandEncoder> accumEncoder = [commandBuffer renderCommandEncoderWithDescriptor: accumPass];
+            accumEncoder.label = @"JUCE path coverage accumulation";
+            const float atlasSize[2] { (float) texWidth, (float) texHeight };
+            [accumEncoder setRenderPipelineState: shared.accumPipeline];
+            [accumEncoder setVertexBuffer: buffers.coverageSegments offset: 0 atIndex: 0];
+            [accumEncoder setFragmentBuffer: buffers.coverageSegments offset: 0 atIndex: 0];
+            [accumEncoder setVertexBytes: atlasSize length: sizeof (atlasSize) atIndex: 1];
+
+            // A page whose paths have no edge inside their areas reads as zero coverage.
+            if (page.segmentCount > 0)
+                [accumEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4
+                               instanceCount: page.segmentCount baseInstance: page.firstSegment];
+
+            // Strokes: their quads (up to eight edges each), built by the vertex shader (strokeAccumVs).
+            if (page.strokeQuadCount > 0)
+            {
+                [accumEncoder setRenderPipelineState: shared.strokeAccumPipeline];
+                [accumEncoder setVertexBuffer: buffers.strokePoints offset: 0 atIndex: 0];
+                [accumEncoder setVertexBytes: &page.firstStrokeQuad length: sizeof (page.firstStrokeQuad) atIndex: 2];
+                [accumEncoder setVertexBuffer: buffers.strokeSubs offset: 0 atIndex: 3];
+                [accumEncoder setVertexBuffer: buffers.strokeJobs offset: 0 atIndex: 4];
+                [accumEncoder setVertexBuffer: buffers.strokeQuads offset: 0 atIndex: 5];
+                [accumEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4
+                               instanceCount: page.strokeQuadCount];
+            }
+            [accumEncoder endEncoding];
+        }
+
+        endPhase (0);
+
+        if (! recorder.coveragePages.empty())
+        {
+            // One SIMD group per row, a few rows per threadgroup.
+            id<MTLComputeCommandEncoder> sumEncoder = [commandBuffer computeCommandEncoder];
+            sumEncoder.label = @"JUCE path coverage prefix sums";
+            const auto simdWidth = jmax ((NSUInteger) 1, shared.prefixSumPipeline.threadExecutionWidth);
+            const auto rowsPerGroup = jmax ((NSUInteger) 1, (NSUInteger) 128 / simdWidth);
+            [sumEncoder setComputePipelineState: shared.prefixSumPipeline];
+
+            for (const auto& page : recorder.coveragePages)
+            {
+                const uint32_t counts[2] { page.entryCount, page.rowCount };
+                [sumEncoder setTexture: page.deltas atIndex: 0];
+                [sumEncoder setTexture: page.coverage atIndex: 1];
+                [sumEncoder setBuffer: buffers.coverageEntries offset: page.firstEntry * sizeof (FR::CoverageEntry) atIndex: 0];
+                [sumEncoder setBytes: counts length: sizeof (counts) atIndex: 1];
+                [sumEncoder dispatchThreadgroups: MTLSizeMake ((page.rowCount + rowsPerGroup - 1) / rowsPerGroup, 1, 1)
+                           threadsPerThreadgroup: MTLSizeMake (rowsPerGroup * simdWidth, 1, 1)];
+            }
+
+            [sumEncoder endEncoding];
+        }
+
+        endPhase (1);
+
+        // Clip masks first: they only depend on geometry, and a mask's parent precedes it.
+        auto& masks = recorder.masks;
+        struct MaskInfo { MetalRendering::Float4 bounds, params; };
+
+        const auto maskInfo = [&masks] (int index) -> MaskInfo
+        {
+            if (index < 0)
+                return {};
+
+            const auto& m = masks[(size_t) index];
+            const MetalRendering::Float4 bounds { (float) m.area.getX(), (float) m.area.getY(),
+                                                  (float) m.area.getRight(), (float) m.area.getBottom() };
+
+            if (m.readsCoverage())
+                return { bounds, { m.inv0.x, m.inv0.y, m.inv0.z > 0.5f ? 3.0f : 2.0f, 0.0f } };
+
+            return { bounds, { (float) -m.area.getX(), (float) -m.area.getY(), 1.0f, 0.0f } };
+        };
+
+        const auto maskTexture = [&] (int index)
+        {
+            if (index < 0)
+                return shared.noMask;
+
+            const auto& m = masks[(size_t) index];
+            return m.readsCoverage() ? recorder.coveragePages[(size_t) m.coveragePage].coverage : m.texture;
+        };
+
+        for (size_t i = 0; i < masks.size(); ++i)
+        {
+            auto& m = masks[i];
+
+            if (m.readsCoverage())
+                continue;
+
+            m.texture = acquireTexture (pooled, m.texWidth, m.texHeight, MTLPixelFormatR8Unorm);
+
+            auto* maskPass = [MTLRenderPassDescriptor renderPassDescriptor];
+            maskPass.colorAttachments[0].texture = m.texture;
+            maskPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            maskPass.colorAttachments[0].clearColor = MTLClearColorMake (0, 0, 0, 0);
+            maskPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            maskPass.renderTargetWidth = (NSUInteger) m.texWidth;
+            maskPass.renderTargetHeight = (NSUInteger) m.texHeight;
+
+            id<MTLRenderCommandEncoder> maskEncoder = [commandBuffer renderCommandEncoderWithDescriptor: maskPass];
+            maskEncoder.label = @"JUCE clip mask";
+            const auto origin = m.area.getPosition().toFloat();
+            const auto parent = maskInfo (m.parent);
+            const MetalRendering::Float4 info[6] { { origin.x, origin.y, 0.0f, 0.0f }, parent.bounds, parent.params, m.inv0, m.inv1,
+                                                   { m.imageWidth, m.imageHeight, m.imageIsAlphaOnly ? 1.0f : 0.0f, 0.0f } };
+            [maskEncoder setFragmentBytes: info length: sizeof (info) atIndex: 0];
+            [maskEncoder setFragmentTexture: maskTexture (m.parent) atIndex: 3];
+
+            if (m.coveragePage >= 0)
+            {
+                [maskEncoder setRenderPipelineState: shared.maskCoveragePipeline];
+                [maskEncoder setFragmentTexture: recorder.coveragePages[(size_t) m.coveragePage].coverage atIndex: 4];
+                [maskEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4];
+            }
+            else
+            {
+                [maskEncoder setRenderPipelineState: shared.maskImagePipeline];
+                [maskEncoder setFragmentTexture: m.image atIndex: 1];
+                [maskEncoder setFragmentSamplerState: m.nearest ? shared.nearestSampler : shared.linearSampler atIndex: 0];
+                [maskEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4];
+            }
+
+            [maskEncoder endEncoding];
+        }
+
+        endPhase (2);
+
+        // Opaque interiors of every target, as indices into the instance buffer (after the clears).
+        std::vector<size_t> opaqueOffsets;
+        {
+            size_t total = 0;
+
+            for (const auto& target : recorder.targets)
+                total += target.opaque.size();
+
+            reserveBuffer (buffers.opaqueIndices, total * sizeof (uint32_t));
+
+            auto* opaqueDst = static_cast<uint32_t*> (buffers.opaqueIndices.contents);
+            size_t offset = 0;
+
+            for (const auto& target : recorder.targets)
+            {
+                opaqueOffsets.push_back (offset);
+
+                // Front to back (the latest draw first), as WebRender orders its opaque batches: GPUs
+                // without hidden-surface removal then reject the earlier ones by depth.
+                for (auto it = target.opaque.rbegin(); it != target.opaque.rend(); ++it)
+                    opaqueDst[offset++] = positionOf[*it];
+            }
+        }
+
+        // Painter's depth: one step per instance in the buffer (see painterDepth in the shader).
+        const float depthStep = 1.0f / (float) (clears.size() + instances.size() + 2);
+
+        // The depth buffer only lives during each pass: in tile memory where the GPU has it.
+        const auto depthStorage = [this]
+        {
+            if (@available (macOS 11.0, *))
+                if ([shared.device supportsFamily: MTLGPUFamilyApple1])
+                    return MTLStorageModeMemoryless;
+
+            return MTLStorageModePrivate;
+        }();
+
+        for (const auto targetIndex : recorder.encodeOrder)
+        {
+            auto& target = recorder.targets[(size_t) targetIndex];
+            const auto isMain = targetIndex == 0;
+
+            if (target.area.isEmpty() || (target.batches.empty() && ! (isMain && (! clears.empty() || recorder.clearMain))))
+                continue;
+
+            const auto& pipelines = shared.getDrawPipelines (isMain && destination.pixelFormat == MTLPixelFormatR8Unorm);
+
+            auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+            if (! isMain)
+            {
+                target.texture = acquireTexture (pooled, target.texWidth, target.texHeight, MTLPixelFormatBGRA8Unorm);
+                pass.renderTargetWidth = (NSUInteger) target.texWidth;
+                pass.renderTargetHeight = (NSUInteger) target.texHeight;
+
+                // The composite samples the whole texture: its coordinates follow the size acquired.
+                if ((int) target.texture.width != target.texWidth || (int) target.texture.height != target.texHeight)
+                {
+                    const MetalRendering::Float4 uv { 0.0f, 0.0f, (float) target.area.getWidth() / (float) target.texture.width,
+                                                      (float) target.area.getHeight() / (float) target.texture.height };
+                    auto* uploaded = static_cast<MetalRendering::Instance*> (buffers.instances.contents) + clears.size();
+
+                    for (const auto& other : recorder.targets)
+                        for (const auto& batch : other.batches)
+                            if (batch.layer == targetIndex)
+                                for (auto i = batch.first; i < batch.first + batch.count; ++i)
+                                    uploaded[i].uv = uv;
+                }
+            }
+
+            pass.colorAttachments[0].texture = isMain ? destination : target.texture;
+            pass.colorAttachments[0].loadAction = isMain && ! recorder.clearMain ? MTLLoadActionLoad : MTLLoadActionClear;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake (0, 0, 0, 0);
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+            // Same size as the colour attachment; cleared to the far plane, never stored.
+            id<MTLTexture> colour = pass.colorAttachments[0].texture;
+            pass.depthAttachment.texture = acquireTexture (pooled, (int) colour.width, (int) colour.height,
+                                                           SharedResources::depthFormat,
+                                                           MTLTextureUsageRenderTarget, depthStorage, true);
+            pass.depthAttachment.loadAction = MTLLoadActionClear;
+            pass.depthAttachment.clearDepth = 1.0;
+            pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+
+            id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor: pass];
+            encoder.label = ! isMain ? @"JUCE transparency layer" : (recorder.destination != nil ? @"JUCE image" : @"JUCE window");
+            const auto origin = target.area.getPosition().toFloat();
+            const float viewport[4] { (float) (isMain ? target.area.getWidth() : target.texWidth),
+                                      (float) (isMain ? target.area.getHeight() : target.texHeight), origin.x, origin.y };
+            const float targetOrigin[2] { origin.x, origin.y };
+            [encoder setVertexBuffer: buffers.instances offset: 0 atIndex: 0];
+            [encoder setFragmentBuffer: buffers.instances offset: 0 atIndex: 0];
+            [encoder setVertexBytes: viewport length: sizeof (viewport) atIndex: 1];
+            [encoder setVertexBytes: &depthStep length: sizeof (depthStep) atIndex: 2];
+            [encoder setFragmentBytes: targetOrigin length: sizeof (targetOrigin) atIndex: 3];
+
+            // The opaque interiors first (colour and depth): what they cover, and their own
+            // interiors, are then rejected before shading.
+            if (! target.opaque.empty())
+            {
+                [encoder setRenderPipelineState: pipelines.opaque];
+                [encoder setDepthStencilState: shared.depthWriteState];
+                [encoder setVertexBuffer: buffers.opaqueIndices offset: opaqueOffsets[(size_t) targetIndex] * sizeof (uint32_t) atIndex: 3];
+                [encoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4
+                          instanceCount: target.opaque.size()];
+            }
+
+            [encoder setDepthStencilState: shared.depthTestState];
+
+            if (isMain && ! clears.empty())
+            {
+                [encoder setRenderPipelineState: pipelines.clear];
+                // Boxes without strokes: one quad each (see the vertex shader 'vs').
+                [encoder drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0 vertexCount: 6
+                          instanceCount: clears.size() baseInstance: 0];
+            }
+
+            [encoder setFragmentTexture: shared.glyphAtlas->getTexture() atIndex: 0];
+            [encoder setFragmentBuffer: buffers.gradientStops offset: 0 atIndex: 4];
+            [encoder setFragmentBuffer: buffers.gradients offset: 0 atIndex: 1];
+            id<MTLRenderPipelineState> boundPipeline = nil;
+            int boundMask = -2, boundCoveragePage = -2;
+
+            for (const auto& batch : target.batches)
+            {
+                if (batch.mask != boundMask)
+                {
+                    const auto info = maskInfo (batch.mask);
+                    [encoder setFragmentTexture: maskTexture (batch.mask) atIndex: 3];
+                    [encoder setFragmentBytes: &info length: sizeof (info) atIndex: 2];
+                    boundMask = batch.mask;
+                }
+
+                if (batch.coveragePage != boundCoveragePage)
+                {
+                    [encoder setFragmentTexture: batch.coveragePage >= 0 ? recorder.coveragePages[(size_t) batch.coveragePage].coverage
+                                                                         : shared.noMask
+                                        atIndex: 4];
+                    boundCoveragePage = batch.coveragePage;
+                }
+
+                auto pipeline = pipelines.blend[batch.family][(size_t) batch.blend];
+
+                if (pipeline != boundPipeline)
+                {
+                    [encoder setRenderPipelineState: pipeline];
+
+                    if (boundPipeline == nil)
+                    {
+                        [encoder setVertexBuffer: buffers.instances offset: 0 atIndex: 0];
+                        [encoder setFragmentBuffer: buffers.instances offset: 0 atIndex: 0];
+                    }
+
+                    boundPipeline = pipeline;
+                }
+
+                const auto image = batch.layer >= 0 ? recorder.targets[(size_t) batch.layer].texture : batch.image;
+                [encoder setFragmentTexture: image atIndex: 1];
+                [encoder setFragmentSamplerState: shared.getSampler (batch.nearest, batch.repeat) atIndex: 0];
+                [encoder drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0 vertexCount: batch.verticesPerInstance()
+                          instanceCount: batch.count baseInstance: clears.size() + batch.first];
+            }
+
+            [encoder endEncoding];
+        }
+    }
+
+private:
+    /*  The software renderer's single-channel box blur (see boxBlurLines in the shader) over
+        job.area: along its rows into a scratch texture, then along its columns back.
+        Measured on an M1, 36 drop shadows of radius 12 (device pixels) per frame: lines held in
+        threadgroup memory, two barriers per pass, took ~4 ms of GPU per frame, whether that
+        memory was a fixed 16 KB or sized to the line; most lines now go through the SIMD-group
+        version, and shadows drawn again come from the cache (ImageQueue::findBlurred).
+    */
+    void encodeBlur (const ImageJob& job, std::vector<id<MTLTexture>>& pooled, id<MTLCommandBuffer> commandBuffer)
+    {
+        const auto& area = job.area;
+        auto scratch = acquireTexture (pooled, area.getWidth(), area.getHeight(), MTLPixelFormatR8Unorm,
+                                       MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+
+        const auto blurLines = [&] (id<MTLTexture> src, id<MTLTexture> dst, Point<int> srcOrigin, Point<int> dstOrigin, bool vertical)
+        {
+            const auto length = (NSUInteger) (vertical ? area.getHeight() : area.getWidth());
+            const auto lines = (NSUInteger) (vertical ? area.getWidth() : area.getHeight());
+            const uint32_t params[8] { (uint32_t) srcOrigin.x, (uint32_t) srcOrigin.y, (uint32_t) dstOrigin.x, (uint32_t) dstOrigin.y,
+                                       (uint32_t) length, vertical ? 1u : 0u, (uint32_t) job.passes, (uint32_t) lines };
+            id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+            encoder.label = vertical ? @"JUCE box blur (columns)" : @"JUCE box blur (rows)";
+            [encoder setTexture: src atIndex: 0];
+            [encoder setTexture: dst atIndex: 1];
+            [encoder setBytes: params length: sizeof (params) atIndex: 0];
+
+            if (const auto simdWidth = shared.blurSimdPipeline.threadExecutionWidth;
+                length <= simdWidth * SharedResources::blurPixelsPerLane
+                 && shared.blurSimdPipeline.maxTotalThreadsPerThreadgroup >= 4 * simdWidth)
+            {
+                // Four lines (SIMD groups) per threadgroup.
+                [encoder setComputePipelineState: shared.blurSimdPipeline];
+                [encoder dispatchThreadgroups: MTLSizeMake ((lines + 3) / 4, 1, 1)
+                        threadsPerThreadgroup: MTLSizeMake (4 * simdWidth, 1, 1)];
+            }
+            else
+            {
+                const auto threads = jmin (SharedResources::blurThreads, (length + 31) / 32 * 32);
+                [encoder setComputePipelineState: shared.blurPipeline];
+                [encoder setThreadgroupMemoryLength: (length + 15) / 16 * 16 atIndex: 0];
+                [encoder dispatchThreadgroups: MTLSizeMake (lines, 1, 1)
+                        threadsPerThreadgroup: MTLSizeMake (threads, 1, 1)];
+            }
+
+            [encoder endEncoding];
+        };
+
+        // Two encoders: the columns read what the rows wrote.
+        blurLines (job.texture, scratch, area.getPosition(), {}, false);
+        blurLines (scratch, job.texture, {}, area.getPosition(), true);
+    }
+
+    SharedResources& shared;
+    std::vector<PooledTexture> texturePool;
+};
+
+//==============================================================================
+/*  The textures of GPU images (MetalPixelData) and the work queued on them.
+    Work on an image's texture (a MetalGraphicsContext drawing into it, a blur, an upload of
+    pixels the CPU wrote) is queued on the message thread while a window paints, then encoded at
+    the start of that window frame's command buffer, before the passes that draw those images:
+    one encode queue and one command queue, so the GPU runs everything in the order it was
+    recorded, and the frame's number covers the caches the work used (glyph atlas, image
+    textures). Reading an image's pixels (readBack) encodes and commits the queued work on the
+    encode queue, after the frames encoded before it, and waits for the GPU.
+*/
+class ImageQueue
+{
+public:
+    ImageQueue() = default;
+
+    ~ImageQueue()
+    {
+        // Frames drawing images hold this object, and wait for their GPU work: what is still
+        // queued was never drawn.
+        dispatch_sync (shared->encodeQueue, ^{});
+        pending.clear();
+        spare.clear();
+
+        for (auto& [key, entry] : blurred)
+            [entry.texture release];
+
+        for (auto& p : texturePool)
+            [p.texture release];
+    }
+
+    // Message thread: the recording of the window being painted (MetalLayerRenderer).
+    FrameRecorder* activeRecorder = nullptr;
+
+    std::unique_ptr<ImageJob> createJob (ImageJob::Kind kind)
+    {
+        std::unique_ptr<ImageJob> job;
+
+        {
+            const ScopedLock sl (lock);
+
+            if (! spare.empty())
+            {
+                job = std::move (spare.back());
+                spare.pop_back();
+            }
+        }
+
+        if (job == nullptr)
+            job = std::make_unique<ImageJob>();
+
+        job->kind = kind;
+        return job;
+    }
+
+    void submit (std::unique_ptr<ImageJob> job)
+    {
+        const ScopedLock sl (lock);
+        pending.push_back (std::move (job));
+    }
+
+    std::vector<std::unique_ptr<ImageJob>> takePending()
+    {
+        const ScopedLock sl (lock);
+        return std::exchange (pending, {});
+    }
+
+    // Jobs whose GPU work has completed.
+    void recycle (std::vector<std::unique_ptr<ImageJob>>& jobs)
+    {
+        for (auto& job : jobs)
+            job->reset();
+
+        const ScopedLock sl (lock);
+
+        for (auto& job : jobs)
+            if (spare.size() < 256)
+                spare.push_back (std::move (job));
+
+        jobs.clear();
+    }
+
+    /*  Encode queue, before encoding queued jobs: their glyphs rasterised, their paths flattened.
+        'window': a frame still being recorded whose glyphs the jobs may use (see readBack).
+    */
+    static void prepare (SharedResources& shared, std::vector<std::unique_ptr<ImageJob>>& jobs, const FrameRecorder* window)
+    {
+        if (window != nullptr)
+            for (const auto& glyph : window->glyphJobs)
+                shared.glyphAtlas->rasterise (glyph);
+
+        for (auto& job : jobs)
+        {
+            if (job->kind != ImageJob::Kind::render)
+                continue;
+
+            for (const auto& glyph : job->recorder.glyphJobs)
+                shared.glyphAtlas->rasterise (glyph);
+
+            job->recorder.resolveCoverage();
+        }
+    }
+
+    /*  Encodes and commits the queued work, then copies 'texture' into a new shared buffer with
+        rows of 'bytesPerRow', and returns it (owned by the caller) once the GPU is done.
+    */
+    id<MTLBuffer> readBack (id<MTLTexture> texture, NSUInteger bytesPerRow)
+    {
+        auto jobs = takePending();
+        auto* jobsToEncode = &jobs;
+
+        // Glyphs the window being painted placed in the atlas are rasterised when its frame is
+        // encoded, after this: queued drawing may use them (the same text in a buffered child).
+        const FrameRecorder* window = MessageManager::existsAndIsCurrentThread() ? activeRecorder : nullptr;
+        __block id<MTLBuffer> result = nil;
+
+        dispatch_sync (shared->encodeQueue, ^
+        {
+            @autoreleasepool
+            {
+                prepare (*shared, *jobsToEncode, window);
+                id<MTLCommandBuffer> commandBuffer = [shared->queue commandBuffer];
+
+                for (auto& job : *jobsToEncode)
+                    encoder.encodeJob (*job, pooled, commandBuffer);
+
+                result = [shared->device newBufferWithLength: bytesPerRow * texture.height options: MTLResourceStorageModeShared];
+
+                if (result != nil)
+                {
+                    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+                    blit.label = @"JUCE image read-back";
+                    [blit copyFromTexture: texture sourceSlice: 0 sourceLevel: 0 sourceOrigin: MTLOriginMake (0, 0, 0)
+                               sourceSize: MTLSizeMake (texture.width, texture.height, 1)
+                                 toBuffer: result destinationOffset: 0 destinationBytesPerRow: bytesPerRow
+                  destinationBytesPerImage: bytesPerRow * texture.height];
+                    [blit endEncoding];
+                }
+
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+                encoder.recycle (pooled, shared->framesRecorded.load());
+            }
+        });
+
+        recycle (jobs);
+        ++readBacksSinceLastStatistics;
+        return result;
+    }
+
+    /*  Message thread: takes the job queued last out of the queue if it is a render into
+        'texture' (nullptr else). Out of the queue, a read-back can't encode it meanwhile; the
+        caller submits it again (it was last, and only the message thread queues jobs), or drops
+        it with recycle().
+    */
+    std::unique_ptr<ImageJob> takeLastRender (id<MTLTexture> texture)
+    {
+        const ScopedLock sl (lock);
+
+        if (pending.empty() || pending.back()->kind != ImageJob::Kind::render || pending.back()->texture != texture)
+            return {};
+
+        auto job = std::move (pending.back());
+        pending.pop_back();
+        return job;
+    }
+
+    void recycle (std::unique_ptr<ImageJob> job)
+    {
+        std::vector<std::unique_ptr<ImageJob>> jobs;
+        jobs.push_back (std::move (job));
+        recycle (jobs);
+    }
+
+    // Message thread: MetalGraphicsContexts drawing into images, not destroyed yet.
+    int openContexts = 0;
+
+    /*  Blurred contents (drop shadows), by the key of what was drawn and blurred: a shadow drawn
+        again with the same path, area and radius reuses the texture blurred the first time,
+        without drawing or blurring it again (as WebRender caches its blurred box shadows). Its
+        pixels are those the first one computed, so it changes none. The
+        textures are shared by the images using them (never written, never pooled), and kept
+        while drawn: entries unused for 240 frames, or beyond 64 MB, are released.
+        Message thread.
+    */
+    id<MTLTexture> findBlurred (uint64_t key)
+    {
+        const auto it = blurred.find (key);
+
+        if (it == blurred.end())
+            return nil;
+
+        it->second.lastUsed = shared->framesRecorded.load();
+        return it->second.texture;
+    }
+
+    void addBlurred (uint64_t key, id<MTLTexture> texture)
+    {
+        auto& entry = blurred[key];
+        shared->imageCache->releaseLater (entry.texture);
+        entry = { [texture retain], shared->framesRecorded.load() };
+    }
+
+    /*  An image texture of exactly that size: one released by an image whose frames have all
+        completed, or a new one.
+    */
+    id<MTLTexture> acquireTexture (int width, int height, MTLPixelFormat format, MTLTextureUsage usage)
+    {
+        const auto completed = shared->framesCompleted.load();
+
+        {
+            const ScopedLock sl (lock);
+
+            for (auto it = texturePool.begin(); it != texturePool.end(); ++it)
+            {
+                const auto t = it->texture;
+
+                if ((int) t.width == width && (int) t.height == height && t.pixelFormat == format
+                     && t.usage == usage && it->released <= completed)
+                {
+                    texturePool.erase (it);
+                    return t;
+                }
+            }
+        }
+
+        auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: format
+                                                                        width: (NSUInteger) width
+                                                                       height: (NSUInteger) height
+                                                                    mipmapped: NO];
+        desc.usage = usage;
+        desc.storageMode = MTLStorageModePrivate;
+        return [shared->device newTextureWithDescriptor: desc];
+    }
+
+    /*  Any thread: an image's texture back to the pool, reused once the frames recorded so far
+        (which may draw it) have completed. Its queued work holds it until encoded.
+    */
+    void releaseTexture (id<MTLTexture> texture)
+    {
+        if (texture == nil)
+            return;
+
+        const ScopedLock sl (lock);
+        texturePool.push_back ({ texture, shared->framesRecorded.load() });
+    }
+
+    /*  Message thread, once per window frame: textures pooled for long (or too many) released,
+        and blurred contents unused for long (or too many).
+    */
+    void trimTextures()
+    {
+        // The read-backs' pool (see readBack): released once unused for long, read-backs or not.
+        if (shared->framesRecorded.load() % 120 == 0)
+            dispatch_async (shared->encodeQueue, ^{ encoder.recycle (pooled, shared->framesRecorded.load()); });
+
+        {
+            const auto now = shared->framesRecorded.load();
+            int64 bytes = 0;
+
+            for (auto& [key, entry] : blurred)
+                bytes += (int64) entry.texture.width * (int64) entry.texture.height
+                           * (entry.texture.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4);
+
+            while (! blurred.empty())
+            {
+                auto oldest = std::min_element (blurred.begin(), blurred.end(),
+                                                [] (const auto& a, const auto& b) { return a.second.lastUsed < b.second.lastUsed; });
+
+                if (now - oldest->second.lastUsed <= 240 && bytes <= 64 * 1024 * 1024)
+                    break;
+
+                const auto t = oldest->second.texture;
+                bytes -= (int64) t.width * (int64) t.height * (t.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4);
+                shared->imageCache->releaseLater (t); // frames in flight may still draw it
+                blurred.erase (oldest);
+            }
+        }
+
+        const auto completed = shared->framesCompleted.load();
+        const auto recorded = shared->framesRecorded.load();
+        const ScopedLock sl (lock);
+        auto excess = (int) texturePool.size() - 64;
+
+        for (auto it = texturePool.begin(); it != texturePool.end();)
+        {
+            if (it->released <= completed && (excess > 0 || recorded - it->released > 240))
+            {
+                [it->texture release];
+                it = texturePool.erase (it);
+                --excess;
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    SharedResourcePointer<SharedResources> shared;
+    std::atomic<int> readBacksSinceLastStatistics { 0 };
+
+private:
+    struct PooledImageTexture { id<MTLTexture> texture; uint64_t released; };
+    struct BlurredContent { id<MTLTexture> texture = nil; uint64_t lastUsed = 0; };
+
+    std::unordered_map<uint64_t, BlurredContent> blurred; // message thread
+
+    CriticalSection lock;
+    std::vector<std::unique_ptr<ImageJob>> pending, spare;
+    std::vector<PooledImageTexture> texturePool;
+
+    // Encode queue (readBack).
+    SceneEncoder encoder { *shared };
+    std::vector<id<MTLTexture>> pooled;
 };
 
 } // namespace MetalRendering
+
+class MetalGraphicsContext;
+
+//==============================================================================
+/*  An image whose pixels live in a Metal texture, as Direct2DPixelData keeps them in Direct2D
+    bitmaps: the type MetalGraphicsContext gives for temporary images (setBufferedToImage, drop
+    shadows, component effects), drawn into, blurred and drawn on the GPU.
+    - Its pixels are in the texture, or in a software copy (made when the CPU reads or writes
+      them through BitmapData), or both; or in neither, while the image is clear. An image made
+      without clearing is cleared all the same.
+    - Work on the texture is queued (ImageQueue) and runs before the window frame that draws the
+      image. If the frame being recorded already draws the texture, the image takes another one
+      for its new pixels (the old ones copied first when kept): the earlier draws keep the earlier
+      pixels, as with software images.
+    - Contexts made outside a window's paint, or off the message thread, draw into the software
+      copy with the software renderer. So do those of an image whose pixels the CPU has read
+      after the GPU drew them: reading them back waits for the GPU to finish all the work queued
+      before, every time (DropShadowEffect reads its component's image on each paint, through
+      Image::convertedToFormat): drawn in software, they are read for free, as before.
+    - RGB images keep their pixels in a BGRA texture and are drawn through a view of it whose
+      alpha is one.
+    - A blur of what was just drawn into a cleared image is cached (ImageQueue::findBlurred):
+      shadows drawn again with the same path take the texture blurred the first time.
+    - The software copy is only made when its pixels are read (a Mac's GPU isn't lost, except an
+      external one unplugged), so the backup setting changes nothing.
+*/
+class MetalPixelData final : public ImagePixelData,
+                             private ImagePixelDataBackupExtensions
+{
+public:
+    MetalPixelData (Image::PixelFormat format, int w, int h) : ImagePixelData (format, w, h) {}
+
+    ~MetalPixelData() override
+    {
+        releaseTexture();
+    }
+
+    /*  Whether the GPU can hold such an image. */
+    static bool canHold (Image::PixelFormat format, int w, int h)
+    {
+        if (w <= 0 || h <= 0 || w > 16384 || h > 16384)
+            return false;
+
+        SharedResourcePointer<MetalRendering::SharedResources> shared;
+
+        if (! shared->isValid())
+            return false;
+
+        switch (format)
+        {
+            case Image::ARGB:           return true;
+            case Image::SingleChannel:  return shared->getDrawPipelines (true).isValid();
+            case Image::RGB:            if (@available (macOS 10.15, *)) return true; return false;
+            case Image::UnknownFormat:
+            default:                    return false;
+        }
+    }
+
+    std::unique_ptr<LowLevelGraphicsContext> createLowLevelContext() override;
+
+    ImagePixelData::Ptr clone() override
+    {
+        jassert (openContexts == 0); // see initialiseBitmapData
+        auto* copy = new MetalPixelData (pixelFormat, width, height);
+        ImagePixelData::Ptr result (copy);
+
+        if (gpuValid && MessageManager::existsAndIsCurrentThread() && copy->ensureTexture())
+        {
+            auto job = queue->createJob (MetalRendering::ImageJob::Kind::copy);
+            job->texture = [copy->texture retain];
+            job->source = [texture retain];
+            queue->submit (std::move (job));
+            copy->gpuValid = true;
+        }
+        else if (gpuValid)
+        {
+            syncBackup (true);
+        }
+
+        if (cpuValid)
+        {
+            copy->backup = backup.createCopy();
+            copy->cpuValid = true;
+        }
+
+        copy->backupEnabled = backupEnabled;
+        return result;
+    }
+
+    std::unique_ptr<ImageType> createType() const override;
+
+    void initialiseBitmapData (Image::BitmapData& bitmap, int x, int y, Image::BitmapData::ReadWriteMode mode) override
+    {
+        // A Graphics drawing into this image must be destroyed before its pixels are accessed:
+        // what it draws is only queued then.
+        jassert (openContexts == 0);
+
+        const auto wholeImage = x == 0 && y == 0 && bitmap.width == width && bitmap.height == height;
+        syncBackup (! (mode == Image::BitmapData::writeOnly && wholeImage));
+        backup.getPixelData()->initialiseBitmapData (bitmap, x, y, mode);
+
+        if (mode != Image::BitmapData::readOnly)
+        {
+            gpuValid = false;
+            sendDataChangeMessage();
+        }
+    }
+
+    void applySingleChannelBoxBlurEffectInArea (Rectangle<int> bounds, int radius) override
+    {
+        const auto area = bounds.getIntersection ({ width, height });
+
+        if (pixelFormat != Image::SingleChannel || radius <= 0 || area.getWidth() <= 2 || area.getHeight() <= 2
+             || jmax (area.getWidth(), area.getHeight()) > MetalRendering::SharedResources::maxBlurLine
+             || ! MessageManager::existsAndIsCurrentThread() || ! queue->shared->canBlur())
+        {
+            ImagePixelData::applySingleChannelBoxBlurEffectInArea (bounds, radius);
+            return;
+        }
+
+        jassert (openContexts == 0); // see initialiseBitmapData
+
+        if (! gpuValid && ! cpuValid)
+            return; // clear: stays clear
+
+        sendDataChangeMessage();
+
+        // Blurring what was just drawn into this cleared image (as DropShadow::drawForPath does),
+        // not drawn since: the result can be cached by the key of that recording.
+        uint64_t key = 0;
+
+        if (pixelFormat != Image::RGB && texture != nil && drawnInFrame != currentFrame())
+        {
+            if (auto render = queue->takeLastRender (texture))
+            {
+                if (const auto drawnKey = render->recorder.clearMain ? render->recorder.contentKey() : 0; drawnKey != 0)
+                {
+                    const uint64_t blurValues[] { drawnKey, (uint64_t) pixelFormat, (uint64_t) width, (uint64_t) height,
+                                                  (uint64_t) area.getX(), (uint64_t) area.getY(), (uint64_t) area.getWidth(),
+                                                  (uint64_t) area.getHeight(), (uint64_t) radius };
+                    key = 0xcbf29ce484222325ull;
+
+                    for (auto v : blurValues)
+                        key = ((key ^ v) * 0x9e3779b97f4a7c15ull) ^ (key >> 29);
+
+                    if (auto cached = queue->findBlurred (key))
+                    {
+                        queue->recycle (std::move (render));
+                        releaseTexture();
+                        texture = [cached retain];
+                        textureShared = true;
+                        gpuValid = true;
+                        cpuValid = false;
+                        return;
+                    }
+                }
+
+                queue->submit (std::move (render));
+            }
+        }
+
+        if (! prepareWrite())
+            return;
+
+        auto job = queue->createJob (MetalRendering::ImageJob::Kind::blur);
+        job->texture = [texture retain];
+        job->area = area;
+        job->passes = 2 * radius;
+        queue->submit (std::move (job));
+
+        if (key != 0)
+        {
+            queue->addBlurred (key, texture);
+            textureShared = true;
+        }
+    }
+
+    /*  Message thread, while recording into 'consumer': the texture to draw this image with, its
+        pending pixels queued first. nil when 'consumer' draws into this image.
+    */
+    id<MTLTexture> textureForDrawing (const MetalRendering::FrameRecorder& consumer)
+    {
+        if (texture != nil && texture == consumer.destination)
+            return nil;
+
+        if (! gpuValid)
+        {
+            if (! ensureTexture())
+                return nil;
+
+            renameIfDrawn (false);
+
+            if (texture == nil || ! queuePixels())
+                return nil;
+
+            gpuValid = true;
+        }
+
+        drawnInFrame = currentFrame();
+        return view != nil ? view : texture;
+    }
+
+    BackupExtensions* getBackupExtensions() override { return this; }
+    const BackupExtensions* getBackupExtensions() const override { return this; }
+
+private:
+    friend class MetalGraphicsContext;
+
+    void setBackupEnabled (bool shouldBackup) override  { backupEnabled = shouldBackup; }
+    bool isBackupEnabled() const override               { return backupEnabled; }
+    bool backupNow() override                           { syncBackup (true); return true; }
+    bool needsBackup() const override                   { return gpuValid && ! cpuValid; }
+    bool canBackup() const override                     { return gpuValid; }
+
+    uint64_t currentFrame() const { return queue->shared->framesRecorded.load(); }
+
+    MTLPixelFormat textureFormat() const noexcept { return pixelFormat == Image::SingleChannel ? MTLPixelFormatR8Unorm : MTLPixelFormatBGRA8Unorm; }
+    int bytesPerPixel() const noexcept            { return pixelFormat == Image::SingleChannel ? 1 : 4; }
+    NSUInteger packedBytesPerRow() const noexcept { return (NSUInteger) ((width * bytesPerPixel() + 3) & ~3); }
+
+    bool ensureTexture()
+    {
+        if (texture != nil)
+            return true;
+
+        auto usage = (MTLTextureUsage) (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+
+        if (pixelFormat == Image::RGB)
+            usage |= MTLTextureUsagePixelFormatView;
+
+        texture = queue->acquireTexture (width, height, textureFormat(), usage);
+
+        if (texture == nil)
+            return false;
+
+        if (pixelFormat == Image::RGB)
+        {
+            if (@available (macOS 10.15, *))
+            {
+                view = [texture newTextureViewWithPixelFormat: MTLPixelFormatBGRA8Unorm
+                                                  textureType: MTLTextureType2D
+                                                       levels: NSMakeRange (0, 1)
+                                                       slices: NSMakeRange (0, 1)
+                                                      swizzle: MTLTextureSwizzleChannelsMake (MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                                                                                              MTLTextureSwizzleBlue, MTLTextureSwizzleOne)];
+            }
+        }
+
+        return true;
+    }
+
+    void releaseTexture()
+    {
+        // A texture shared with the blurred contents cache isn't pooled: the cache and other images
+        // hold it too.
+        if (std::exchange (textureShared, false))
+            queue->shared->imageCache->releaseLater (std::exchange (texture, nil));
+        else
+            queue->releaseTexture (std::exchange (texture, nil));
+
+        queue->shared->imageCache->releaseLater (std::exchange (view, nil));
+    }
+
+    /*  The frame being recorded draws the texture, or it is shared (blurred contents): the pixels
+        about to be written go into another one (the current ones copied over when 'keepPixels').
+    */
+    void renameIfDrawn (bool keepPixels)
+    {
+        if (texture == nil || (drawnInFrame != currentFrame() && ! textureShared))
+            return;
+
+        id<MTLTexture> old = [texture retain];
+        releaseTexture();
+
+        if (ensureTexture() && keepPixels && gpuValid)
+        {
+            auto job = queue->createJob (MetalRendering::ImageJob::Kind::copy);
+            job->texture = [texture retain];
+            job->source = [old retain];
+            queue->submit (std::move (job));
+        }
+
+        [old release];
+    }
+
+    /*  Queues the image's pixels into its texture: the software copy's, or clear ones. */
+    [[nodiscard]] bool queuePixels()
+    {
+        if (! cpuValid)
+        {
+            auto job = queue->createJob (MetalRendering::ImageJob::Kind::clear);
+            job->texture = [texture retain];
+            queue->submit (std::move (job));
+            return true;
+        }
+
+        const auto bytesPerRow = packedBytesPerRow();
+        id<MTLBuffer> staging = [queue->shared->device newBufferWithLength: bytesPerRow * (NSUInteger) height
+                                                                    options: MTLResourceStorageModeShared];
+
+        if (staging == nil)
+            return false;
+
+        // JUCE's ARGB is premultiplied BGRA in memory, RGB is BGR (little-endian): as the texture.
+        const Image::BitmapData src (backup, Image::BitmapData::readOnly);
+        auto* dst = static_cast<uint8*> (staging.contents);
+
+        for (int y = 0; y < height; ++y)
+        {
+            const auto* line = src.getLinePointer (y);
+            auto* out = dst + (size_t) y * bytesPerRow;
+
+            if (pixelFormat == Image::RGB)
+            {
+                for (int x = 0; x < width; ++x)
+                {
+                    const auto* px = line + x * src.pixelStride;
+                    out[4 * x] = px[0];
+                    out[4 * x + 1] = px[1];
+                    out[4 * x + 2] = px[2];
+                    out[4 * x + 3] = 255;
+                }
+            }
+            else
+            {
+                memcpy (out, line, (size_t) (width * bytesPerPixel()));
+            }
+        }
+
+        auto job = queue->createJob (MetalRendering::ImageJob::Kind::upload);
+        job->texture = [texture retain];
+        job->staging = staging;
+        job->stagingBytesPerRow = bytesPerRow;
+        queue->submit (std::move (job));
+        return true;
+    }
+
+    /*  Before GPU work writes into the texture (message thread). Returns false without a texture. */
+    bool prepareWrite()
+    {
+        if (! ensureTexture())
+            return false;
+
+        renameIfDrawn (true);
+
+        if (texture == nil || (! gpuValid && cpuValid && ! queuePixels()))
+            return false;
+
+        gpuValid = true;
+        cpuValid = false;
+        return true;
+    }
+
+    /*  Makes the software copy current ('needPixels': else it is about to be overwritten). */
+    void syncBackup (bool needPixels)
+    {
+        if (backup.isNull())
+        {
+            backup = Image (pixelFormat, width, height, true, SoftwareImageType());
+
+            if (! gpuValid)
+            {
+                cpuValid = true;
+                return;
+            }
+        }
+
+        if (cpuValid)
+            return;
+
+        cpuValid = true;
+
+        if (! needPixels)
+            return;
+
+        if (! gpuValid || texture == nil)
+        {
+            backup.clear (backup.getBounds());
+            return;
+        }
+
+        readBackAfterDrawing = true;
+        const auto bytesPerRow = packedBytesPerRow();
+        id<MTLBuffer> pixels = queue->readBack (texture, bytesPerRow);
+
+        if (pixels == nil)
+        {
+            backup.clear (backup.getBounds());
+            return;
+        }
+
+        const Image::BitmapData dst (backup, Image::BitmapData::writeOnly);
+        const auto* src = static_cast<const uint8*> (pixels.contents);
+
+        for (int y = 0; y < height; ++y)
+        {
+            const auto* in = src + (size_t) y * bytesPerRow;
+            auto* line = dst.getLinePointer (y);
+
+            if (pixelFormat == Image::RGB)
+            {
+                for (int x = 0; x < width; ++x)
+                {
+                    auto* px = line + x * dst.pixelStride;
+                    px[0] = in[4 * x];
+                    px[1] = in[4 * x + 1];
+                    px[2] = in[4 * x + 2];
+                }
+            }
+            else
+            {
+                memcpy (line, in, (size_t) (width * bytesPerPixel()));
+            }
+        }
+
+        [pixels release];
+    }
+
+    SharedResourcePointer<MetalRendering::ImageQueue> queue;
+    id<MTLTexture> texture = nil, view = nil;   // view: RGB images, alpha one
+    Image backup;                               // software copy
+    bool gpuValid = false, cpuValid = false, backupEnabled = true;
+    bool readBackAfterDrawing = false;          // contexts then draw in software (see above)
+    int openContexts = 0;                       // GPU contexts drawing into it, message thread
+    bool textureShared = false;                 // with the blurred contents cache: never written
+    uint64_t drawnInFrame = 0;                  // the last frame recorded that draws the texture
+
+    JUCE_LEAK_DETECTOR (MetalPixelData)
+};
+
+/*  The type of MetalPixelData; images the GPU can't hold (sizes, formats) are software ones. */
+class MetalImageType final : public ImageType
+{
+public:
+    ImagePixelData::Ptr create (Image::PixelFormat format, int w, int h, bool clearImage) const override
+    {
+        if (MetalPixelData::canHold (format, w, h))
+            return *new MetalPixelData (format, w, h);
+
+        return SoftwareImageType().create (format, w, h, clearImage);
+    }
+
+    int getTypeID() const override { return (int) ByteOrder::makeInt ('m', 't', 'l', 'i'); }
+};
+
+inline std::unique_ptr<ImageType> MetalPixelData::createType() const { return std::make_unique<MetalImageType>(); }
 
 //==============================================================================
 class MetalGraphicsContext final : public LowLevelGraphicsContext
@@ -2228,7 +4683,13 @@ public:
 
         while (! layers.empty())
             endTransparencyLayer();
+
+        if (whenDone != nullptr)
+            whenDone();
     }
+
+    // Called once the context is destroyed: an image context's recording is then complete.
+    std::function<void()> whenDone;
 
     //==============================================================================
     bool isVectorDevice() const override { return false; }
@@ -2361,7 +4822,7 @@ public:
         {
             // GPU mask: the image's alpha, transformed, rendered into an R8 mask (times the parent).
             const auto imageToDevice = t.followedBy (state().xf);
-            auto texture = image.isValid() && ! imageToDevice.isSingularity() ? recorder.imageCache->get (image) : nil;
+            auto texture = image.isValid() && ! imageToDevice.isSingularity() ? textureOf (image) : nil;
 
             if (texture != nil)
             {
@@ -2739,9 +5200,9 @@ public:
         if (delegate != nullptr)
             return delegate->context->strokePath (path, stroke, t);
 
-        // Same outline as LowLevelGraphicsContext's default: built in user space (stroke thickness
-        // in user units), with curve accuracy matching the physical pixel scale; built on the
-        // encode thread (see FrameRecorder::CoverageJob).
+        // Same centre line as LowLevelGraphicsContext's default: flattened in user space (stroke
+        // thickness in user units), with curve accuracy matching the physical pixel scale, on the
+        // encode thread (see FrameRecorder::CoverageJob); its outline is built on the GPU.
         const auto accuracy = getPhysicalPixelScaleFactor();
 
         id<MTLTexture> pattern = nil;
@@ -2781,7 +5242,7 @@ public:
         if (! canDrawNatively)
             return fallback ("drawImage (size)", bounds.transformedBy (t), [&] (auto& c) { c.drawImage (image, t); });
 
-        auto texture = recorder.imageCache->get (image);
+        auto texture = textureOf (image);
 
         if (texture == nil)
             return fallback ("drawImage (no texture)", bounds.transformedBy (t), [&] (auto& c) { c.drawImage (image, t); });
@@ -2902,7 +5363,11 @@ public:
 
     std::unique_ptr<ImageType> getPreferredImageTypeForTemporaryImages() const override
     {
-        return std::make_unique<SoftwareImageType>();
+        // While a software delegate draws, what it draws into is software.
+        if (delegate != nullptr)
+            return std::make_unique<SoftwareImageType>();
+
+        return std::make_unique<MetalImageType>();
     }
 
     uint64_t getFrameId() const override { return 0; }
@@ -3004,6 +5469,15 @@ private:
         int mask = -1;                   // clip mask in recorder.masks, -1: none
     };
 
+    /*  The texture to draw an image with: a GPU image's own, or the upload of another. */
+    id<MTLTexture> textureOf (const Image& image)
+    {
+        if (auto* gpuImage = dynamic_cast<MetalPixelData*> (image.getPixelData().get()))
+            return gpuImage->textureForDrawing (recorder);
+
+        return recorder.imageCache->get (image);
+    }
+
     State& state() noexcept             { return stack.back(); }
     const State& state() const noexcept { return stack.back(); }
 
@@ -3092,7 +5566,7 @@ private:
         if (imageToDevice.isSingularity())
             return -1;
 
-        pattern = recorder.imageCache->get (fill.image);
+        pattern = textureOf (fill.image);
 
         if (pattern == nil)
             return -1;
@@ -3195,9 +5669,9 @@ private:
 
         const auto spread = g.spreadMethod == ColourGradient::SpreadMethod::reflect ? 1.0f
                           : g.spreadMethod == ColourGradient::SpreadMethod::repeat  ? 2.0f : 0.0f;
-        // The colour stops, interpolated per pixel in the shader as CoreGraphics does (CGGradient:
-        // float components, not premultiplied), where the software renderer quantises them into
-        // a lookup table.
+        // The colour stops, interpolated and dithered per pixel in the shader as CoreGraphics does
+        // (CGGradient: float components, not premultiplied), where the software renderer quantises
+        // them into a lookup table.
         info.row0.w = (float) recorder.gradientStops.size();
         info.row1.w = (float) g.getNumColours();
 
@@ -3307,6 +5781,71 @@ private:
 };
 
 //==============================================================================
+inline std::unique_ptr<LowLevelGraphicsContext> MetalPixelData::createLowLevelContext()
+{
+    jassert (openContexts == 0); // see initialiseBitmapData
+    sendDataChangeMessage();
+
+    // Recorded while a window paints (its frame then encodes it): the caches the recording uses
+    // keep what that frame needs.
+    if (! readBackAfterDrawing && MessageManager::existsAndIsCurrentThread() && queue->activeRecorder != nullptr)
+    {
+        const auto clearFirst = ! gpuValid && ! cpuValid;
+
+        if (prepareWrite())
+        {
+            auto job = queue->createJob (MetalRendering::ImageJob::Kind::render);
+            job->texture = [texture retain];
+
+            const Rectangle<int> bounds { width, height };
+            auto& shared = *queue->shared;
+            auto& recorder = job->recorder;
+            recorder.clear (bounds);
+            recorder.clearMain = clearFirst;
+            recorder.destination = texture;
+            recorder.frameReleases = &job->releases;
+            recorder.device = shared.device;
+            recorder.glyphAtlas = shared.glyphAtlas.get();
+            recorder.imageCache = shared.imageCache.get();
+            recorder.glyphOutlines = &shared.glyphOutlines;
+            recorder.collectReasons = false;
+
+            auto context = std::make_unique<MetalGraphicsContext> (recorder, 1.0f, RectangleList<int> (bounds));
+            ++openContexts;
+            ++queue->openContexts;
+
+            // Holds the image: the context may outlive the Image it was made from.
+            context->whenDone = [self = Ptr (this), recorded = job.release(), frame = currentFrame()]
+            {
+                auto& image = *static_cast<MetalPixelData*> (self.get());
+                std::unique_ptr<MetalRendering::ImageJob> done (recorded);
+                --image.openContexts;
+                --image.queue->openContexts;
+
+                // Destroyed after the paint it was made in: the textures and glyphs it recorded were
+                // only kept for that frame. Its drawing is lost, as if never made.
+                if (frame != image.currentFrame() || image.queue->activeRecorder == nullptr)
+                {
+                    jassertfalse;
+                    image.queue->recycle (std::move (done));
+                    image.gpuValid = image.cpuValid = false;
+                    return;
+                }
+
+                done->recorder.encodeOrder.push_back (0); // the image's own target, after its layers
+                image.queue->submit (std::move (done));
+            };
+
+            return context;
+        }
+    }
+
+    syncBackup (true);
+    gpuValid = false;
+    return backup.getPixelData()->createLowLevelContext();
+}
+
+//==============================================================================
 /*  Per-window GPU renderer: retained target, instance buffers, presentation. */
 class MetalLayerRenderer
 {
@@ -3338,16 +5877,8 @@ public:
 
             for (auto t : f.pooled)
                 [t release];
-            [f.instances release];
-            [f.gradients release];
-            [f.coverageSegments release];
-            [f.coverageEntries release];
-            [f.opaqueIndices release];
-            [f.gradientStops release];
+            f.buffers.release();
         }
-
-        for (auto& p : texturePool)
-            [p.texture release];
 
         [retained release];
         dispatch_release (inFlight);
@@ -3370,11 +5901,18 @@ public:
         // Every token taken from here on becomes a frame: slots are used in turn, so the slot
         // taken now is the one of the frame three frames ago, whose GPU work is complete.
         if (dispatch_semaphore_wait (inFlight, DISPATCH_TIME_NOW) != 0)
+        {
+            if (statistics != nullptr)
+                ++statistics->skippedRefreshes;
+
             return dirty;
+        }
 
         auto& frame = frames[(size_t) (frameIndex++ % numFramesInFlight)];
         frame.number = frameIndex;
         frame.releases.releaseAll();
+        images->recycle (frame.jobs);
+        images->trimTextures();
         shared->imageCache->collectReleases (frame.releases); // textures of changed or deleted images
 
         // Only when they change: setting them every frame would commit a CA transaction.
@@ -3454,11 +5992,18 @@ public:
 
         const auto paintStart = Time::getMillisecondCounterHiRes();
 
+        // Images drawn into meanwhile (setBufferedToImage, shadows) queue their work: this frame
+        // encodes it first.
+        const auto previousRecorder = std::exchange (images->activeRecorder, &recorder);
+
         {
             MetalGraphicsContext context (recorder, scale, region);
             paint (context);
         }
 
+        images->activeRecorder = previousRecorder;
+        jassert (images->openContexts == 0); // a Graphics on a temporary image outlived the paint
+        frame.jobs = images->takePending();
         recorder.encodeOrder.push_back (0); // the window's own target, after all its layers
 
         const auto paintMs = Time::getMillisecondCounterHiRes() - paintStart;
@@ -3494,13 +6039,15 @@ public:
         window: frames, CPU time per frame (paint on the message thread + encode), GPU time per frame and the software
         fallbacks by reason.
     */
-    struct Statistics
+    struct Statistics : public MetalRendering::EncodeStatistics
     {
-        void addFrame (double paintMs, MetalRendering::FrameRecorder& frameRecorder, int64 dirty)
+        void addFrame (double paintMs, MetalRendering::FrameRecorder& frameRecorder, int64 dirty, int jobs, int readBacks)
         {
             ++frames;
             paintMsTotal += paintMs;
             dirtyPixels += dirty;
+            imageJobs += jobs;
+            imageReadBacks += readBacks;
 
             // Scene size, to tell what the GPU time goes into.
             layers += (int64) frameRecorder.targets.size() - 1;
@@ -3543,12 +6090,15 @@ public:
                  << String ((double) gpuMicros.exchange (0) / 1000.0 / gpuFrameCount, 3) << " ms/frame"
                  << " (of which coverage accumulation " << phaseMs (0) << ", prefix sums " << phaseMs (1)
                  << ", masks " << phaseMs (2) << "), present copy "
-                 << String ((double) presentMicros.exchange (0) / 1000.0 / gpuFrameCount, 3) << " ms/frame; per frame: " << String ((double) instances / frames, 0) << " instances (" << String ((double) opaqueInstances / frames, 0) << " opaque) in "
+                 << String ((double) presentMicros.exchange (0) / 1000.0 / gpuFrameCount, 3) << " ms/frame; waits for a drawable "
+                 << String ((double) drawableWaitMicros.exchange (0) / 1000.0, 1) << " ms, " << missedDrawables.exchange (0) << " none, "
+                 << skippedRefreshes.exchange (0) << " refreshes with all frames in flight; per frame: " << String ((double) instances / frames, 0) << " instances (" << String ((double) opaqueInstances / frames, 0) << " opaque) in "
                  << String ((double) drawCallsTotal / frames, 0) << " draw calls, "
                  << String ((double) layers / frames, 1) << " layers (" << String ((double) layerPixels / frames / 1.0e6, 2) << " Mpx), "
                  << String ((double) masks / frames, 1) << " mask textures (" << String ((double) maskPixels / frames / 1.0e6, 2) << " Mpx), "
                  << "path rectangles " << String ((double) coveragePixels / frames / 1.0e6, 2) << " Mpx, "
-                 << "dirty " << String ((double) dirtyPixels / frames / 1.0e6, 2) << " Mpx";
+                 << "dirty " << String ((double) dirtyPixels / frames / 1.0e6, 2) << " Mpx, "
+                 << "image jobs " << String ((double) imageJobs / frames, 1) << ", image read-backs " << imageReadBacks;
 
             if (! fallbacks.empty())
             {
@@ -3565,20 +6115,21 @@ public:
             layers = masks = instances = opaqueInstances = layerPixels = maskPixels = coveragePixels = 0;
             dirtyPixels = 0;
             drawCallsTotal = 0;
+            imageJobs = imageReadBacks = 0;
             lastPrint = now;
         }
 
-        std::atomic<int64> gpuMicros { 0 }, phaseMicros[3] {};
-        std::atomic<double> frameGpuStart { 0.0 };
+        std::atomic<int64> gpuMicros { 0 };
         std::atomic<int> gpuFrames { 0 };
         std::atomic<int64> presentMicros { 0 };
+        std::atomic<int64> drawableWaitMicros { 0 }, missedDrawables { 0 }, skippedRefreshes { 0 };
         double encodeMsTotal = 0.0; // on the encode queue, like addFrame
-        int64 drawCallsTotal = 0;   // instance batches after reordering, encode queue
 
     private:
         int frames = 0;
         int64 layers = 0, masks = 0, instances = 0, opaqueInstances = 0, layerPixels = 0, maskPixels = 0, coveragePixels = 0;
         int64 dirtyPixels = 0; // device pixels repainted
+        int64 imageJobs = 0, imageReadBacks = 0;
         double paintMsTotal = 0.0, lastPrint = Time::getMillisecondCounterHiRes();
         std::map<std::string, int> fallbacks;
     };
@@ -3588,7 +6139,8 @@ private:
 
     struct Frame
     {
-        id<MTLBuffer> instances = nil, gradients = nil, coverageSegments = nil, coverageEntries = nil, opaqueIndices = nil, gradientStops = nil;
+        MetalRendering::EncodeBuffers buffers;
+        std::vector<std::unique_ptr<MetalRendering::ImageJob>> jobs; // image work encoded before the frame's passes
         std::vector<id<MTLTexture>> pooled;   // mask/layer textures, back to the pool when this frame completes
         MetalRendering::DeferredReleases releases;
         MetalRendering::FrameRecorder recorder; // painted on the message thread, then encoded
@@ -3610,81 +6162,6 @@ private:
         }
     }
 
-    //==============================================================================
-    /*  Mask and layer textures, reused across frames (as the OpenGL renderer keeps its
-        framebuffers). A texture goes back to the pool once the frame that used it has completed;
-        pooled textures unused for 120 frames of this window are released (when it next draws).
-        The smallest pooled texture at least as large as asked is reused (up to four times the
-        area): layers and clips change size from frame to frame as their content moves, and
-        creating a Metal texture is costly. Passes are limited to the size asked
-        (renderTargetWidth / Height), so the rest of a larger texture costs no GPU time.
-    */
-    struct PooledTexture { id<MTLTexture> texture; uint64_t lastUsed; };
-
-    id<MTLTexture> acquireTexture (Frame& frame, int width, int height, MTLPixelFormat format,
-                                   MTLTextureUsage usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
-                                   MTLStorageMode storage = MTLStorageModePrivate, bool exactSize = false)
-    {
-        const auto areaOf = [] (id<MTLTexture> t) { return (int64) t.width * (int64) t.height; };
-        const auto maxArea = 4 * (int64) width * (int64) height;
-        auto best = texturePool.end();
-
-        for (auto it = texturePool.begin(); it != texturePool.end(); ++it)
-        {
-            const auto t = it->texture;
-
-            const auto sizeFits = exactSize ? ((int) t.width == width && (int) t.height == height)
-                                            : ((int) t.width >= width && (int) t.height >= height);
-
-            if (sizeFits && t.pixelFormat == format && t.usage == usage && t.storageMode == storage
-                 && areaOf (t) <= maxArea && (best == texturePool.end() || areaOf (t) < areaOf (best->texture)))
-            {
-                best = it;
-            }
-        }
-
-        if (best != texturePool.end())
-        {
-            auto texture = best->texture;
-            texturePool.erase (best);
-            frame.pooled.push_back (texture);
-            return texture;
-        }
-
-        auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: format
-                                                                        width: (NSUInteger) width
-                                                                       height: (NSUInteger) height
-                                                                    mipmapped: NO];
-        desc.usage = usage;
-        desc.storageMode = storage;
-        auto texture = [shared->device newTextureWithDescriptor: desc];
-        frame.pooled.push_back (texture);
-        return texture;
-    }
-
-    void recycleTextures (Frame& frame)
-    {
-        for (auto t : frame.pooled)
-            texturePool.push_back ({ t, frame.number });
-
-        frame.pooled.clear();
-
-        for (auto it = texturePool.begin(); it != texturePool.end();)
-        {
-            if (frame.number - it->lastUsed > 120)
-            {
-                [it->texture release];
-                it = texturePool.erase (it);
-            }
-            else
-            {
-                ++it;
-            }
-        }
-    }
-
-    std::vector<PooledTexture> texturePool;
-
     void encodeFrame (Frame& frame, id<MTLTexture> destination, bool renderSync, double paintMs)
     {
         @autoreleasepool
@@ -3692,14 +6169,17 @@ private:
             // Statistics read the scene first: once committed, the frame can complete and be
             // handed back to the message thread before this returns.
             if (statistics != nullptr)
-                statistics->addFrame (paintMs, frame.recorder, frame.dirtyPixels);
+                statistics->addFrame (paintMs, frame.recorder, frame.dirtyPixels, (int) frame.jobs.size(),
+                                      images->readBacksSinceLastStatistics.exchange (0));
 
             const auto start = Time::getMillisecondCounterHiRes();
+            MetalRendering::ImageQueue::prepare (*shared, frame.jobs, nullptr);
+
             for (const auto& job : frame.recorder.glyphJobs)
                 shared->glyphAtlas->rasterise (job);
 
             frame.recorder.resolveCoverage();
-            recycleTextures (frame);
+            encoder.recycle (frame.pooled, frame.number);
             encodeAndPresent (frame, destination, renderSync);
 
             if (statistics != nullptr)
@@ -3747,406 +6227,12 @@ private:
 
     void encodeAndPresent (Frame& frame, id<MTLTexture> destination, bool renderSync)
     {
-        auto& recorder = frame.recorder;
-        const auto& clears = recorder.clears;
-        const auto& instances = recorder.instances;
-        const auto count = clears.size() + instances.size();
-        const auto bytes = jmax ((size_t) 256, count * sizeof (MetalRendering::Instance));
-
-        if (frame.instances == nil || frame.instances.length < bytes)
-        {
-            [frame.instances release];
-            frame.instances = [shared->device newBufferWithLength: bytes * 2 options: MTLResourceStorageModeShared];
-        }
-
-        // The clears, then each target's instances in their reordered sequence (see
-        // FrameRecorder::reorder); 'positionOf' maps a recorded instance to its buffer position.
-        auto* dst = static_cast<MetalRendering::Instance*> (frame.instances.contents);
-        std::copy (clears.begin(), clears.end(), dst);
-        std::vector<uint32_t> positionOf (instances.size(), 0);
-        uint32_t next = 0;
-
-        for (auto& target : recorder.targets)
-        {
-            for (auto index : recorder.reorder (target, next))
-            {
-                dst[clears.size() + next] = instances[index];
-                positionOf[index] = (uint32_t) (clears.size() + next);
-                ++next;
-            }
-
-            if (statistics != nullptr)
-                statistics->drawCallsTotal += (int64) target.batches.size();
-        }
-
-        const auto& gradients = recorder.gradients;
-        const auto gradientBytes = jmax ((size_t) 256, gradients.size() * sizeof (MetalRendering::GradientInfo));
-
-        if (frame.gradients == nil || frame.gradients.length < gradientBytes)
-        {
-            [frame.gradients release];
-            frame.gradients = [shared->device newBufferWithLength: gradientBytes * 2 options: MTLResourceStorageModeShared];
-        }
-
-        std::copy (gradients.begin(), gradients.end(), static_cast<MetalRendering::GradientInfo*> (frame.gradients.contents));
-
-        const auto& stops = recorder.gradientStops;
-        const auto stopBytes = jmax ((size_t) 256, stops.size() * sizeof (MetalRendering::Float4));
-
-        if (frame.gradientStops == nil || frame.gradientStops.length < stopBytes)
-        {
-            [frame.gradientStops release];
-            frame.gradientStops = [shared->device newBufferWithLength: stopBytes * 2 options: MTLResourceStorageModeShared];
-        }
-
-        std::copy (stops.begin(), stops.end(), static_cast<MetalRendering::Float4*> (frame.gradientStops.contents));
-
         id<MTLCommandBuffer> commandBuffer = [shared->queue commandBuffer];
 
-        // Coverage atlas pages first: path fills read them.
-        using FR = MetalRendering::FrameRecorder;
-        const auto& segments = recorder.coverageSegments;
-        const auto segmentBytes = jmax ((size_t) 256, segments.size() * sizeof (FR::CoverageSegment));
+        for (auto& job : frame.jobs)
+            encoder.encodeJob (*job, frame.pooled, commandBuffer);
 
-        if (frame.coverageSegments == nil || frame.coverageSegments.length < segmentBytes)
-        {
-            [frame.coverageSegments release];
-            frame.coverageSegments = [shared->device newBufferWithLength: segmentBytes * 2 options: MTLResourceStorageModeShared];
-        }
-
-        std::copy (segments.begin(), segments.end(), static_cast<FR::CoverageSegment*> (frame.coverageSegments.contents));
-
-        const auto& entries = recorder.coverageEntries;
-        const auto entryBytes = jmax ((size_t) 256, entries.size() * sizeof (FR::CoverageEntry));
-
-        if (frame.coverageEntries == nil || frame.coverageEntries.length < entryBytes)
-        {
-            [frame.coverageEntries release];
-            frame.coverageEntries = [shared->device newBufferWithLength: entryBytes * 2 options: MTLResourceStorageModeShared];
-        }
-
-        std::copy (entries.begin(), entries.end(), static_cast<FR::CoverageEntry*> (frame.coverageEntries.contents));
-
-        // Statistics: the coverage and mask phases go in their own command buffers, timed apart.
-        const auto endPhase = [&] (int phase)
-        {
-            if (auto phaseStats = statistics)
-            {
-                [commandBuffer addCompletedHandler: ^(id<MTLCommandBuffer> done)
-                {
-                    phaseStats->phaseMicros[phase] += (int64) ((done.GPUEndTime - done.GPUStartTime) * 1.0e6);
-
-                    if (phase == 0)
-                        phaseStats->frameGpuStart = done.GPUStartTime;
-                }];
-                [commandBuffer commit];
-                commandBuffer = [shared->queue commandBuffer];
-            }
-        };
-
-        for (auto& page : recorder.coveragePages)
-        {
-            const auto texWidth = FR::pooledSize (page.width), texHeight = FR::pooledSize (page.height);
-            page.deltas = acquireTexture (frame, texWidth, texHeight, MTLPixelFormatR32Float);
-            // The summed winding numbers fit half floats (2^-10 below 2, under 1/255) for the
-            // non-zero rule, clamped at 1: only the deltas need 32 bits. The even-odd rule reads
-            // the winding modulo 2, which half floats lose with many overlapping layers (a step of
-            // 2^-6 from 16 on): pages holding even-odd paths keep 32 bits.
-            page.coverage = acquireTexture (frame, texWidth, texHeight, page.evenOdd ? MTLPixelFormatR32Float : MTLPixelFormatR16Float,
-                                            MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
-
-            auto* accumPass = [MTLRenderPassDescriptor renderPassDescriptor];
-            accumPass.colorAttachments[0].texture = page.deltas;
-            accumPass.colorAttachments[0].loadAction = MTLLoadActionClear;
-            accumPass.colorAttachments[0].clearColor = MTLClearColorMake (0, 0, 0, 0);
-            accumPass.colorAttachments[0].storeAction = MTLStoreActionStore;
-            accumPass.renderTargetWidth = (NSUInteger) texWidth;
-            accumPass.renderTargetHeight = (NSUInteger) texHeight;
-
-            id<MTLRenderCommandEncoder> accumEncoder = [commandBuffer renderCommandEncoderWithDescriptor: accumPass];
-            accumEncoder.label = @"JUCE path coverage accumulation";
-            const float atlasSize[2] { (float) texWidth, (float) texHeight };
-            [accumEncoder setRenderPipelineState: shared->accumPipeline];
-            [accumEncoder setVertexBuffer: frame.coverageSegments offset: 0 atIndex: 0];
-            [accumEncoder setFragmentBuffer: frame.coverageSegments offset: 0 atIndex: 0];
-            [accumEncoder setVertexBytes: atlasSize length: sizeof (atlasSize) atIndex: 1];
-
-            // A page whose paths have no edge inside their areas reads as zero coverage.
-            if (page.segmentCount > 0)
-                [accumEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4
-                               instanceCount: page.segmentCount baseInstance: page.firstSegment];
-            [accumEncoder endEncoding];
-        }
-
-        endPhase (0);
-
-        if (! recorder.coveragePages.empty())
-        {
-            // One SIMD group per row, a few rows per threadgroup.
-            id<MTLComputeCommandEncoder> sumEncoder = [commandBuffer computeCommandEncoder];
-            sumEncoder.label = @"JUCE path coverage prefix sums";
-            const auto simdWidth = jmax ((NSUInteger) 1, shared->prefixSumPipeline.threadExecutionWidth);
-            const auto rowsPerGroup = jmax ((NSUInteger) 1, (NSUInteger) 128 / simdWidth);
-            [sumEncoder setComputePipelineState: shared->prefixSumPipeline];
-
-            for (const auto& page : recorder.coveragePages)
-            {
-                const uint32_t counts[2] { page.entryCount, page.rowCount };
-                [sumEncoder setTexture: page.deltas atIndex: 0];
-                [sumEncoder setTexture: page.coverage atIndex: 1];
-                [sumEncoder setBuffer: frame.coverageEntries offset: page.firstEntry * sizeof (FR::CoverageEntry) atIndex: 0];
-                [sumEncoder setBytes: counts length: sizeof (counts) atIndex: 1];
-                [sumEncoder dispatchThreadgroups: MTLSizeMake ((page.rowCount + rowsPerGroup - 1) / rowsPerGroup, 1, 1)
-                           threadsPerThreadgroup: MTLSizeMake (rowsPerGroup * simdWidth, 1, 1)];
-            }
-
-            [sumEncoder endEncoding];
-        }
-
-        endPhase (1);
-
-        // Clip masks first: they only depend on geometry, and a mask's parent precedes it.
-        auto& masks = recorder.masks;
-        struct MaskInfo { MetalRendering::Float4 bounds, params; };
-
-        const auto maskInfo = [&masks] (int index) -> MaskInfo
-        {
-            if (index < 0)
-                return {};
-
-            const auto& m = masks[(size_t) index];
-            const MetalRendering::Float4 bounds { (float) m.area.getX(), (float) m.area.getY(),
-                                                  (float) m.area.getRight(), (float) m.area.getBottom() };
-
-            if (m.readsCoverage())
-                return { bounds, { m.inv0.x, m.inv0.y, m.inv0.z > 0.5f ? 3.0f : 2.0f, 0.0f } };
-
-            return { bounds, { (float) -m.area.getX(), (float) -m.area.getY(), 1.0f, 0.0f } };
-        };
-
-        const auto maskTexture = [&] (int index)
-        {
-            if (index < 0)
-                return shared->noMask;
-
-            const auto& m = masks[(size_t) index];
-            return m.readsCoverage() ? recorder.coveragePages[(size_t) m.coveragePage].coverage : m.texture;
-        };
-
-        for (size_t i = 0; i < masks.size(); ++i)
-        {
-            auto& m = masks[i];
-
-            if (m.readsCoverage())
-                continue;
-
-            m.texture = acquireTexture (frame, m.texWidth, m.texHeight, MTLPixelFormatR8Unorm);
-
-            auto* maskPass = [MTLRenderPassDescriptor renderPassDescriptor];
-            maskPass.colorAttachments[0].texture = m.texture;
-            maskPass.colorAttachments[0].loadAction = MTLLoadActionClear;
-            maskPass.colorAttachments[0].clearColor = MTLClearColorMake (0, 0, 0, 0);
-            maskPass.colorAttachments[0].storeAction = MTLStoreActionStore;
-            maskPass.renderTargetWidth = (NSUInteger) m.texWidth;
-            maskPass.renderTargetHeight = (NSUInteger) m.texHeight;
-
-            id<MTLRenderCommandEncoder> maskEncoder = [commandBuffer renderCommandEncoderWithDescriptor: maskPass];
-            maskEncoder.label = @"JUCE clip mask";
-            const auto origin = m.area.getPosition().toFloat();
-            const auto parent = maskInfo (m.parent);
-            const MetalRendering::Float4 info[6] { { origin.x, origin.y, 0.0f, 0.0f }, parent.bounds, parent.params, m.inv0, m.inv1,
-                                                   { m.imageWidth, m.imageHeight, m.imageIsAlphaOnly ? 1.0f : 0.0f, 0.0f } };
-            [maskEncoder setFragmentBytes: info length: sizeof (info) atIndex: 0];
-            [maskEncoder setFragmentTexture: maskTexture (m.parent) atIndex: 3];
-
-            if (m.coveragePage >= 0)
-            {
-                [maskEncoder setRenderPipelineState: shared->maskCoveragePipeline];
-                [maskEncoder setFragmentTexture: recorder.coveragePages[(size_t) m.coveragePage].coverage atIndex: 4];
-                [maskEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4];
-            }
-            else
-            {
-                [maskEncoder setRenderPipelineState: shared->maskImagePipeline];
-                [maskEncoder setFragmentTexture: m.image atIndex: 1];
-                [maskEncoder setFragmentSamplerState: m.nearest ? shared->nearestSampler : shared->linearSampler atIndex: 0];
-                [maskEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4];
-            }
-
-            [maskEncoder endEncoding];
-        }
-
-        endPhase (2);
-
-        // Opaque interiors of every target, as indices into the instance buffer (after the clears).
-        std::vector<size_t> opaqueOffsets;
-        {
-            size_t total = 0;
-
-            for (const auto& target : recorder.targets)
-                total += target.opaque.size();
-
-            const auto opaqueBytes = jmax ((size_t) 256, total * sizeof (uint32_t));
-
-            if (frame.opaqueIndices == nil || frame.opaqueIndices.length < opaqueBytes)
-            {
-                [frame.opaqueIndices release];
-                frame.opaqueIndices = [shared->device newBufferWithLength: opaqueBytes * 2 options: MTLResourceStorageModeShared];
-            }
-
-            auto* opaqueDst = static_cast<uint32_t*> (frame.opaqueIndices.contents);
-            size_t offset = 0;
-
-            for (const auto& target : recorder.targets)
-            {
-                opaqueOffsets.push_back (offset);
-
-                // Front to back (the latest draw first), as WebRender orders its opaque batches: GPUs
-                // without hidden-surface removal then reject the earlier ones by depth.
-                for (auto it = target.opaque.rbegin(); it != target.opaque.rend(); ++it)
-                    opaqueDst[offset++] = positionOf[*it];
-            }
-        }
-
-        // Painter's depth: one step per instance in the buffer (see painterDepth in the shader).
-        const float depthStep = 1.0f / (float) (clears.size() + instances.size() + 2);
-
-        // The depth buffer only lives during each pass: in tile memory where the GPU has it.
-        const auto depthStorage = [this]
-        {
-            if (@available (macOS 11.0, *))
-                if ([shared->device supportsFamily: MTLGPUFamilyApple1])
-                    return MTLStorageModeMemoryless;
-
-            return MTLStorageModePrivate;
-        }();
-
-        for (const auto targetIndex : recorder.encodeOrder)
-        {
-            auto& target = recorder.targets[(size_t) targetIndex];
-            const auto isMain = targetIndex == 0;
-
-            if (target.area.isEmpty() || (target.batches.empty() && ! (isMain && ! clears.empty())))
-                continue;
-
-            auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-
-            if (! isMain)
-            {
-                target.texture = acquireTexture (frame, target.texWidth, target.texHeight, MTLPixelFormatBGRA8Unorm);
-                pass.renderTargetWidth = (NSUInteger) target.texWidth;
-                pass.renderTargetHeight = (NSUInteger) target.texHeight;
-
-                // The composite samples the whole texture: its coordinates follow the size acquired.
-                if ((int) target.texture.width != target.texWidth || (int) target.texture.height != target.texHeight)
-                {
-                    const MetalRendering::Float4 uv { 0.0f, 0.0f, (float) target.area.getWidth() / (float) target.texture.width,
-                                                      (float) target.area.getHeight() / (float) target.texture.height };
-                    auto* uploaded = static_cast<MetalRendering::Instance*> (frame.instances.contents) + clears.size();
-
-                    for (const auto& other : recorder.targets)
-                        for (const auto& batch : other.batches)
-                            if (batch.layer == targetIndex)
-                                for (auto i = batch.first; i < batch.first + batch.count; ++i)
-                                    uploaded[i].uv = uv;
-                }
-            }
-
-            pass.colorAttachments[0].texture = isMain ? destination : target.texture;
-            pass.colorAttachments[0].loadAction = isMain ? MTLLoadActionLoad : MTLLoadActionClear;
-            pass.colorAttachments[0].clearColor = MTLClearColorMake (0, 0, 0, 0);
-            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-            // Same size as the colour attachment; cleared to the far plane, never stored.
-            id<MTLTexture> colour = pass.colorAttachments[0].texture;
-            pass.depthAttachment.texture = acquireTexture (frame, (int) colour.width, (int) colour.height,
-                                                           MetalRendering::SharedResources::depthFormat,
-                                                           MTLTextureUsageRenderTarget, depthStorage, true);
-            pass.depthAttachment.loadAction = MTLLoadActionClear;
-            pass.depthAttachment.clearDepth = 1.0;
-            pass.depthAttachment.storeAction = MTLStoreActionDontCare;
-
-            id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor: pass];
-            encoder.label = isMain ? @"JUCE window" : @"JUCE transparency layer";
-            const auto origin = target.area.getPosition().toFloat();
-            const float viewport[4] { (float) (isMain ? target.area.getWidth() : target.texWidth),
-                                      (float) (isMain ? target.area.getHeight() : target.texHeight), origin.x, origin.y };
-            const float targetOrigin[2] { origin.x, origin.y };
-            [encoder setVertexBuffer: frame.instances offset: 0 atIndex: 0];
-            [encoder setFragmentBuffer: frame.instances offset: 0 atIndex: 0];
-            [encoder setVertexBytes: viewport length: sizeof (viewport) atIndex: 1];
-            [encoder setVertexBytes: &depthStep length: sizeof (depthStep) atIndex: 2];
-            [encoder setFragmentBytes: targetOrigin length: sizeof (targetOrigin) atIndex: 3];
-
-            // The opaque interiors first (colour and depth): what they cover, and their own
-            // interiors, are then rejected before shading.
-            if (! target.opaque.empty())
-            {
-                [encoder setRenderPipelineState: shared->opaquePipeline];
-                [encoder setDepthStencilState: shared->depthWriteState];
-                [encoder setVertexBuffer: frame.opaqueIndices offset: opaqueOffsets[(size_t) targetIndex] * sizeof (uint32_t) atIndex: 3];
-                [encoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4
-                          instanceCount: target.opaque.size()];
-            }
-
-            [encoder setDepthStencilState: shared->depthTestState];
-
-            if (isMain && ! clears.empty())
-            {
-                [encoder setRenderPipelineState: shared->clearPipeline];
-                // Boxes without strokes: one quad each (see the vertex shader 'vs').
-                [encoder drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0 vertexCount: 6
-                          instanceCount: clears.size() baseInstance: 0];
-            }
-
-            [encoder setFragmentTexture: shared->glyphAtlas->getTexture() atIndex: 0];
-            [encoder setFragmentBuffer: frame.gradientStops offset: 0 atIndex: 4];
-            [encoder setFragmentBuffer: frame.gradients offset: 0 atIndex: 1];
-            id<MTLRenderPipelineState> boundPipeline = nil;
-            int boundMask = -2, boundCoveragePage = -2;
-
-            for (const auto& batch : target.batches)
-            {
-                if (batch.mask != boundMask)
-                {
-                    const auto info = maskInfo (batch.mask);
-                    [encoder setFragmentTexture: maskTexture (batch.mask) atIndex: 3];
-                    [encoder setFragmentBytes: &info length: sizeof (info) atIndex: 2];
-                    boundMask = batch.mask;
-                }
-
-                if (batch.coveragePage != boundCoveragePage)
-                {
-                    [encoder setFragmentTexture: batch.coveragePage >= 0 ? recorder.coveragePages[(size_t) batch.coveragePage].coverage
-                                                                         : shared->noMask
-                                        atIndex: 4];
-                    boundCoveragePage = batch.coveragePage;
-                }
-
-                auto pipeline = shared->blendPipelines[batch.family][(size_t) batch.blend];
-
-                if (pipeline != boundPipeline)
-                {
-                    [encoder setRenderPipelineState: pipeline];
-
-                    if (boundPipeline == nil)
-                    {
-                        [encoder setVertexBuffer: frame.instances offset: 0 atIndex: 0];
-                        [encoder setFragmentBuffer: frame.instances offset: 0 atIndex: 0];
-                    }
-
-                    boundPipeline = pipeline;
-                }
-
-                const auto image = batch.layer >= 0 ? recorder.targets[(size_t) batch.layer].texture : batch.image;
-                [encoder setFragmentTexture: image atIndex: 1];
-                [encoder setFragmentSamplerState: shared->getSampler (batch.nearest, batch.repeat) atIndex: 0];
-                [encoder drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0 vertexCount: batch.verticesPerInstance()
-                          instanceCount: batch.count baseInstance: clears.size() + batch.first];
-            }
-
-            [encoder endEncoding];
-        }
+        encoder.encode (frame.buffers, frame.pooled, frame.recorder, commandBuffer, destination, statistics);
 
         auto semaphore = inFlight;
         auto stats = statistics;
@@ -4221,10 +6307,17 @@ private:
             @autoreleasepool
             {
                 id<MTLCommandBuffer> present = [queue commandBuffer];
+                const auto waitStart = Time::getMillisecondCounterHiRes();
                 id<CAMetalDrawable> drawable = encodePresentCopy (present, source, layer);
+
+                if (stats != nullptr)
+                    stats->drawableWaitMicros += (int64) ((Time::getMillisecondCounterHiRes() - waitStart) * 1000.0);
 
                 if (drawable == nil)
                 {
+                    if (stats != nullptr)
+                        ++stats->missedDrawables;
+
                     requestRepaint();
                     return;
                 }
@@ -4245,6 +6338,8 @@ private:
     }
 
     SharedResourcePointer<MetalRendering::SharedResources> shared;
+    SharedResourcePointer<MetalRendering::ImageQueue> images;
+    MetalRendering::SceneEncoder encoder { *shared };
     std::array<Frame, numFramesInFlight> frames;
     uint64_t frameIndex = 0;
     id<MTLTexture> retained = nil;

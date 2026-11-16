@@ -1306,6 +1306,10 @@ public:
 
     void onVBlank (double timestampSec)
     {
+       #if JUCE_METAL_RENDERER
+        gpuFrameSinceVBlank = false;
+       #endif
+
         callVBlankListeners (timestampSec);
         setNeedsDisplayRectangles();
     }
@@ -2003,6 +2007,7 @@ public:
    #if JUCE_METAL_RENDERER
     std::unique_ptr<MetalLayerRenderer> gpuRenderer;
     bool usingGpuRenderer = false;
+    bool gpuFrameSinceVBlank = false; // see displayLayer
 
     static constexpr auto metalEngineName = "Metal Renderer";
     static constexpr auto metalLayerCoreGraphicsEngineName = "CoreGraphics Metal Layer Renderer";
@@ -2304,12 +2309,27 @@ private:
        #if JUCE_METAL_RENDERER
         if (usingGpuRenderer)
         {
+            // One frame per refresh, as AppKit's display cycle paces drawRect. Core Animation calls
+            // displayLayer at the end of any run loop pass in which the layer was marked, so a
+            // repaint requested while painting (a label updated from a meter's paint, a
+            // componentPainted listener: it is called for every visible child on each pass) would
+            // be displayed straight away, and that frame would ask for the next one: more frames
+            // than refreshes, and WindowServer then holds the drawables (nextDrawable waits up to a
+            // second; seen as a few frames per second). What is asked for meanwhile stays queued
+            // until the next refresh (onVBlank). Live resize draws straight away.
+            const auto liveResize = [view inLiveResize];
+
+            if (gpuFrameSinceVBlank && ! liveResize)
+                return;
+
+            gpuFrameSinceVBlank = true;
+
             // Repaints requested while painting stay queued, with the rects that couldn't be drawn.
             auto notDrawn = gpuRenderer->drawRectangleList (static_cast<CAMetalLayer*> (layer),
                                                             scale,
                                                             [this] (LowLevelGraphicsContext& context) { handlePaint (context); },
                                                             std::exchange (deferredRepaints, {}),
-                                                            [view inLiveResize],
+                                                            liveResize,
                                                             component.isOpaque());
             deferredRepaints.add (notDrawn);
             return;
